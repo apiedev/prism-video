@@ -59,6 +59,14 @@ namespace Prism.FFmpeg
         private float[] _audioBuffer;
         private AudioSource _audioSource;
 
+        // Audio ring buffer for smooth playback
+        private float[] _audioRingBuffer;
+        private int _audioRingWritePos;
+        private int _audioRingReadPos;
+        private int _audioRingSize;
+        private readonly object _audioLock = new object();
+        private bool _audioStarted;
+
         // ============================================================================
         // Properties
         // ============================================================================
@@ -250,6 +258,12 @@ namespace Prism.FFmpeg
             {
                 UpdateVideoTexture();
             }
+
+            // Update audio ring buffer from main thread
+            if (currentState == PrismFFmpegBridge.PrismState.Playing)
+            {
+                UpdateAudioBuffer();
+            }
         }
 
         private void OnDestroy()
@@ -403,6 +417,13 @@ namespace Prism.FFmpeg
 
         public void Close()
         {
+            // Stop audio first
+            if (_audioSource != null && _audioSource.isPlaying)
+            {
+                _audioSource.Stop();
+            }
+            _audioStarted = false;
+
             if (_player != IntPtr.Zero)
             {
                 PrismFFmpegBridge.prism_player_close(_player);
@@ -419,6 +440,14 @@ namespace Prism.FFmpeg
             if (_audioBufferHandle.IsAllocated)
             {
                 _audioBufferHandle.Free();
+            }
+
+            // Clear ring buffer
+            lock (_audioLock)
+            {
+                _audioRingBuffer = null;
+                _audioRingWritePos = 0;
+                _audioRingReadPos = 0;
             }
 
             _currentStreamInfo = null;
@@ -547,16 +576,71 @@ namespace Prism.FFmpeg
             _audioSource.playOnAwake = false;
             _audioSource.volume = _volume;
             _audioSource.spatialBlend = 0f; // 2D audio
+            _audioSource.loop = true; // Keep audio source running
 
             int sampleRate = PrismFFmpegBridge.prism_player_get_audio_sample_rate(_player);
             int channels = PrismFFmpegBridge.prism_player_get_audio_channels(_player);
 
-            // Create audio buffer (1 second worth)
-            int bufferSize = sampleRate * channels;
-            _audioBuffer = new float[bufferSize];
+            // Create transfer buffer for native calls
+            int transferSize = 4096 * channels;
+            _audioBuffer = new float[transferSize];
             _audioBufferHandle = GCHandle.Alloc(_audioBuffer, GCHandleType.Pinned);
 
-            Debug.Log("[PrismFFmpeg] Audio: " + sampleRate + " Hz, " + channels + " channels");
+            // Create ring buffer (500ms worth of audio for smooth playback)
+            _audioRingSize = (sampleRate * channels) / 2;
+            _audioRingBuffer = new float[_audioRingSize];
+            _audioRingWritePos = 0;
+            _audioRingReadPos = 0;
+            _audioStarted = false;
+
+            Debug.Log("[PrismFFmpeg] Audio: " + sampleRate + " Hz, " + channels + " channels, ring buffer: " + _audioRingSize + " samples");
+        }
+
+        private void UpdateAudioBuffer()
+        {
+            if (_player == IntPtr.Zero || _audioBuffer == null || !_audioBufferHandle.IsAllocated)
+                return;
+
+            if (State != PrismFFmpegBridge.PrismState.Playing)
+                return;
+
+            // Calculate available space in ring buffer
+            int available;
+            lock (_audioLock)
+            {
+                int used = (_audioRingWritePos - _audioRingReadPos + _audioRingSize) % _audioRingSize;
+                available = _audioRingSize - used - 1;
+            }
+
+            if (available < _audioBuffer.Length)
+                return;
+
+            // Get samples from native plugin
+            IntPtr bufferPtr = _audioBufferHandle.AddrOfPinnedObject();
+            int samplesRead = PrismFFmpegBridge.prism_player_get_audio_samples(_player, bufferPtr, _audioBuffer.Length);
+
+            if (samplesRead > 0)
+            {
+                lock (_audioLock)
+                {
+                    for (int i = 0; i < samplesRead; i++)
+                    {
+                        _audioRingBuffer[_audioRingWritePos] = _audioBuffer[i];
+                        _audioRingWritePos = (_audioRingWritePos + 1) % _audioRingSize;
+                    }
+
+                    // Start audio playback once we have enough buffered (100ms)
+                    if (!_audioStarted)
+                    {
+                        int buffered = (_audioRingWritePos - _audioRingReadPos + _audioRingSize) % _audioRingSize;
+                        if (buffered > _audioRingSize / 5)
+                        {
+                            _audioStarted = true;
+                            _audioSource.Play();
+                        }
+                    }
+                }
+            }
         }
 
         private System.Collections.IEnumerator OpenWithResolution(string url)
@@ -641,43 +725,36 @@ namespace Prism.FFmpeg
 
         private void OnAudioFilterRead(float[] data, int channels)
         {
-            if (_player == IntPtr.Zero || _audioBuffer == null || !_audioBufferHandle.IsAllocated)
-                return;
-
-            if (State != PrismFFmpegBridge.PrismState.Playing)
+            if (_audioRingBuffer == null || !_audioStarted)
             {
-                // Fill with silence
                 Array.Clear(data, 0, data.Length);
                 return;
             }
 
-            // Get audio samples from native player
-            int samplesNeeded = data.Length;
-            IntPtr bufferPtr = _audioBufferHandle.AddrOfPinnedObject();
-
-            int samplesRead = PrismFFmpegBridge.prism_player_get_audio_samples(_player, bufferPtr, samplesNeeded);
-
-            if (samplesRead > 0)
+            lock (_audioLock)
             {
-                // Copy to output
-                int copyCount = Math.Min(samplesRead, data.Length);
-                Array.Copy(_audioBuffer, data, copyCount);
+                int available = (_audioRingWritePos - _audioRingReadPos + _audioRingSize) % _audioRingSize;
 
-                // Apply volume
-                for (int i = 0; i < copyCount; i++)
+                if (available == 0)
                 {
-                    data[i] *= _volume;
+                    // Buffer underrun - fill with silence
+                    Array.Clear(data, 0, data.Length);
+                    return;
                 }
 
-                // Fill remaining with silence
-                if (copyCount < data.Length)
+                int toCopy = Math.Min(data.Length, available);
+
+                for (int i = 0; i < toCopy; i++)
                 {
-                    Array.Clear(data, copyCount, data.Length - copyCount);
+                    data[i] = _audioRingBuffer[_audioRingReadPos] * _volume;
+                    _audioRingReadPos = (_audioRingReadPos + 1) % _audioRingSize;
                 }
-            }
-            else
-            {
-                Array.Clear(data, 0, data.Length);
+
+                // Fill remaining with silence if buffer underrun
+                if (toCopy < data.Length)
+                {
+                    Array.Clear(data, toCopy, data.Length - toCopy);
+                }
             }
         }
     }
