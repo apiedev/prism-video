@@ -1,6 +1,7 @@
 using UnityEngine;
 using UnityEditor;
 using Prism;
+using Prism.Streaming;
 
 namespace Prism.Editor
 {
@@ -10,6 +11,8 @@ namespace Prism.Editor
         private SerializedProperty _sourceType;
         private SerializedProperty _videoClip;
         private SerializedProperty _url;
+        private SerializedProperty _streamQuality;
+        private SerializedProperty _autoResolveUrls;
         private SerializedProperty _playOnAwake;
         private SerializedProperty _loop;
         private SerializedProperty _volume;
@@ -17,13 +20,15 @@ namespace Prism.Editor
         private SerializedProperty _targetTexture;
         private SerializedProperty _resolution;
 
-        private bool _showPlaybackControls = true;
+        private bool _showStreamingInfo = true;
 
         private void OnEnable()
         {
             _sourceType = serializedObject.FindProperty("_sourceType");
             _videoClip = serializedObject.FindProperty("_videoClip");
             _url = serializedObject.FindProperty("_url");
+            _streamQuality = serializedObject.FindProperty("_streamQuality");
+            _autoResolveUrls = serializedObject.FindProperty("_autoResolveUrls");
             _playOnAwake = serializedObject.FindProperty("_playOnAwake");
             _loop = serializedObject.FindProperty("_loop");
             _volume = serializedObject.FindProperty("_volume");
@@ -48,13 +53,49 @@ namespace Prism.Editor
                 case PrismSourceType.VideoClip:
                     EditorGUILayout.PropertyField(_videoClip);
                     break;
+
                 case PrismSourceType.Url:
-                    EditorGUILayout.PropertyField(_url);
+                    EditorGUILayout.PropertyField(_url, new GUIContent("Direct URL"));
+                    EditorGUILayout.HelpBox("Use direct video URLs (.mp4, .webm, etc.)", MessageType.Info);
                     break;
+
+                case PrismSourceType.Stream:
+                    EditorGUILayout.PropertyField(_url, new GUIContent("Stream URL"));
+                    EditorGUILayout.PropertyField(_streamQuality);
+
+                    // Show supported platforms
+                    EditorGUILayout.HelpBox(
+                        "Supported: YouTube, Twitch, Vimeo, Facebook, Twitter, TikTok, and 1000+ more via yt-dlp",
+                        MessageType.Info);
+
+                    // Show yt-dlp status
+                    bool ytdlpAvailable = StreamResolverFactory.IsYtdlpAvailable;
+                    if (!ytdlpAvailable)
+                    {
+                        EditorGUILayout.HelpBox(
+                            "yt-dlp not found! Install from: https://github.com/yt-dlp/yt-dlp\n" +
+                            "Windows: winget install yt-dlp\n" +
+                            "Mac: brew install yt-dlp\n" +
+                            "Linux: sudo apt install yt-dlp",
+                            MessageType.Warning);
+                    }
+                    else
+                    {
+                        EditorGUILayout.HelpBox($"yt-dlp found at: {StreamResolverFactory.YtdlpResolver.YtdlpPath}", MessageType.None);
+                    }
+                    break;
+
                 case PrismSourceType.WebRTC:
                     EditorGUILayout.HelpBox("WebRTC source requires additional setup. See PrismWebRTCReceiver.", MessageType.Info);
                     break;
             }
+
+            EditorGUILayout.Space();
+
+            // Streaming section
+            EditorGUILayout.LabelField("Streaming", EditorStyles.boldLabel);
+            EditorGUILayout.PropertyField(_autoResolveUrls, new GUIContent("Auto-Resolve URLs",
+                "Automatically detect and resolve YouTube/Twitch URLs when using SetSource()"));
 
             EditorGUILayout.Space();
 
@@ -95,15 +136,41 @@ namespace Prism.Editor
 
             EditorGUILayout.Space();
 
-            // Runtime controls (only in play mode)
+            // Runtime info (only in play mode)
             if (Application.isPlaying)
             {
-                EditorGUILayout.LabelField("Runtime Controls", EditorStyles.boldLabel);
+                EditorGUILayout.LabelField("Runtime", EditorStyles.boldLabel);
 
-                EditorGUILayout.LabelField($"State: {player.State}");
-                EditorGUILayout.LabelField($"Duration: {player.Duration:F1}s");
-                EditorGUILayout.LabelField($"Time: {player.Time:F1}s ({player.NormalizedTime:P0})");
+                // State
+                EditorGUILayout.LabelField("State", player.State.ToString());
 
+                // Stream info
+                if (player.CurrentStreamInfo != null && player.CurrentStreamInfo.Success)
+                {
+                    _showStreamingInfo = EditorGUILayout.Foldout(_showStreamingInfo, "Stream Info");
+                    if (_showStreamingInfo)
+                    {
+                        EditorGUI.indentLevel++;
+                        if (!string.IsNullOrEmpty(player.CurrentStreamInfo.Title))
+                            EditorGUILayout.LabelField("Title", player.CurrentStreamInfo.Title);
+                        EditorGUILayout.LabelField("Format", player.CurrentStreamInfo.Format);
+                        EditorGUILayout.LabelField("Live Stream", player.IsLiveStream ? "Yes" : "No");
+                        if (!string.IsNullOrEmpty(player.ResolvedUrl))
+                        {
+                            EditorGUILayout.LabelField("Resolved URL");
+                            EditorGUILayout.SelectableLabel(player.ResolvedUrl, GUILayout.Height(40));
+                        }
+                        EditorGUI.indentLevel--;
+                    }
+                }
+
+                // Playback info
+                if (!player.IsLiveStream)
+                {
+                    EditorGUILayout.LabelField($"Time: {player.Time:F1}s / {player.Duration:F1}s ({player.NormalizedTime:P0})");
+                }
+
+                // Controls
                 EditorGUILayout.BeginHorizontal();
                 if (GUILayout.Button("Play"))
                 {
@@ -119,12 +186,18 @@ namespace Prism.Editor
                 }
                 EditorGUILayout.EndHorizontal();
 
-                // Seek slider
-                float newTime = EditorGUILayout.Slider("Seek", (float)player.Time, 0f, (float)player.Duration);
-                if (Mathf.Abs(newTime - (float)player.Time) > 0.5f)
+                // Seek slider (not for live streams)
+                if (!player.IsLiveStream && player.Duration > 0)
                 {
-                    player.Seek(newTime);
+                    float newTime = EditorGUILayout.Slider("Seek", (float)player.Time, 0f, (float)player.Duration);
+                    if (Mathf.Abs(newTime - (float)player.Time) > 0.5f)
+                    {
+                        player.Seek(newTime);
+                    }
                 }
+
+                // Force repaint for live updates
+                Repaint();
             }
 
             serializedObject.ApplyModifiedProperties();

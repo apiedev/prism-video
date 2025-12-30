@@ -24,6 +24,9 @@ namespace Prism
             playerObj.transform.SetParent(transform);
             _player = playerObj.AddComponent<PrismPlayer>();
 
+            // Set source to URL with test video
+            _player.SetSource(_testVideoUrl);
+
             // Create screen quad
             _screen = GameObject.CreatePrimitive(PrimitiveType.Quad);
             _screen.name = "Video Screen";

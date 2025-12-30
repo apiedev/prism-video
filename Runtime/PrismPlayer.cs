@@ -1,4 +1,6 @@
 using System;
+using System.Threading.Tasks;
+using Prism.Streaming;
 using UnityEngine;
 using UnityEngine.Video;
 
@@ -9,12 +11,14 @@ namespace Prism
         None,
         VideoClip,
         Url,
+        Stream,  // Auto-resolves URLs (YouTube, Twitch, etc.)
         WebRTC
     }
 
     public enum PrismState
     {
         Idle,
+        Resolving,  // Resolving stream URL
         Preparing,
         Ready,
         Playing,
@@ -30,6 +34,10 @@ namespace Prism
         [SerializeField] private VideoClip _videoClip;
         [SerializeField] private string _url;
 
+        [Header("Streaming")]
+        [SerializeField] private StreamQuality _streamQuality = StreamQuality.Auto;
+        [SerializeField] private bool _autoResolveUrls = true;
+
         [Header("Playback")]
         [SerializeField] private bool _playOnAwake = false;
         [SerializeField] private bool _loop = false;
@@ -43,23 +51,30 @@ namespace Prism
         private VideoPlayer _videoPlayer;
         private AudioSource _audioSource;
         private PrismState _state = PrismState.Idle;
+        private string _resolvedUrl;
+        private StreamInfo _currentStreamInfo;
+        private bool _playAfterResolve;
 
         public PrismSourceType SourceType => _sourceType;
         public PrismState State => _state;
         public VideoPlayer VideoPlayer => _videoPlayer;
         public RenderTexture TargetTexture => _targetTexture;
+        public StreamInfo CurrentStreamInfo => _currentStreamInfo;
+        public string ResolvedUrl => _resolvedUrl;
 
         public double Duration => _videoPlayer != null ? _videoPlayer.length : 0;
         public double Time => _videoPlayer != null ? _videoPlayer.time : 0;
         public float NormalizedTime => Duration > 0 ? (float)(Time / Duration) : 0f;
         public bool IsPlaying => _state == PrismState.Playing;
         public bool IsPrepared => _videoPlayer != null && _videoPlayer.isPrepared;
+        public bool IsLiveStream => _currentStreamInfo?.IsLiveStream ?? false;
 
         public event Action OnPrepared;
         public event Action OnStarted;
         public event Action OnPaused;
         public event Action OnStopped;
         public event Action OnLoopPointReached;
+        public event Action<StreamInfo> OnStreamResolved;
         public event Action<string> OnError;
 
         private void Awake()
@@ -68,7 +83,7 @@ namespace Prism
 
             if (_playOnAwake && _sourceType != PrismSourceType.None)
             {
-                Prepare();
+                Play();
             }
         }
 
@@ -124,14 +139,35 @@ namespace Prism
             _sourceType = PrismSourceType.VideoClip;
             _videoClip = clip;
             _url = null;
+            _resolvedUrl = null;
+            _currentStreamInfo = null;
             _state = PrismState.Idle;
         }
 
         public void SetSource(string url)
         {
-            _sourceType = PrismSourceType.Url;
+            // Auto-detect if this needs stream resolution
+            var resolver = StreamResolverFactory.GetResolver(url);
+            bool needsResolution = !(resolver is DirectUrlResolver) && _autoResolveUrls;
+
+            _sourceType = needsResolution ? PrismSourceType.Stream : PrismSourceType.Url;
             _url = url;
             _videoClip = null;
+            _resolvedUrl = null;
+            _currentStreamInfo = null;
+            _state = PrismState.Idle;
+
+            Debug.Log($"[Prism] Source set: {url} (Type: {_sourceType}, Resolver: {resolver.Name})");
+        }
+
+        public void SetStreamSource(string url, StreamQuality quality = StreamQuality.Auto)
+        {
+            _sourceType = PrismSourceType.Stream;
+            _url = url;
+            _streamQuality = quality;
+            _videoClip = null;
+            _resolvedUrl = null;
+            _currentStreamInfo = null;
             _state = PrismState.Idle;
         }
 
@@ -148,7 +184,41 @@ namespace Prism
             }
         }
 
-        public void Prepare()
+        public void SetStreamQuality(StreamQuality quality)
+        {
+            _streamQuality = quality;
+        }
+
+        public async void Play()
+        {
+            if (_state == PrismState.Idle)
+            {
+                if (_sourceType == PrismSourceType.Stream)
+                {
+                    _playAfterResolve = true;
+                    await ResolveAndPrepareAsync();
+                }
+                else
+                {
+                    Prepare();
+                }
+                return;
+            }
+
+            if (_state == PrismState.Resolving)
+            {
+                _playAfterResolve = true;
+                return;
+            }
+
+            if (_state == PrismState.Ready || _state == PrismState.Paused)
+            {
+                _videoPlayer.Play();
+                _state = PrismState.Playing;
+            }
+        }
+
+        public async void Prepare()
         {
             if (_sourceType == PrismSourceType.None)
             {
@@ -156,6 +226,64 @@ namespace Prism
                 return;
             }
 
+            if (_sourceType == PrismSourceType.Stream)
+            {
+                await ResolveAndPrepareAsync();
+                return;
+            }
+
+            PrepareInternal();
+        }
+
+        private async Task ResolveAndPrepareAsync()
+        {
+            if (string.IsNullOrEmpty(_url))
+            {
+                HandleError("No URL set for stream source");
+                return;
+            }
+
+            _state = PrismState.Resolving;
+            Debug.Log($"[Prism] Resolving stream: {_url}");
+
+            try
+            {
+                var resolver = StreamResolverFactory.GetResolver(_url);
+                _currentStreamInfo = await resolver.ResolveAsync(_url, _streamQuality);
+
+                if (!_currentStreamInfo.Success)
+                {
+                    HandleError($"Stream resolution failed: {_currentStreamInfo.Error}");
+                    return;
+                }
+
+                _resolvedUrl = _currentStreamInfo.DirectUrl;
+                Debug.Log($"[Prism] Resolved to: {_resolvedUrl}");
+
+                if (!string.IsNullOrEmpty(_currentStreamInfo.Title))
+                {
+                    Debug.Log($"[Prism] Title: {_currentStreamInfo.Title}");
+                }
+
+                OnStreamResolved?.Invoke(_currentStreamInfo);
+
+                // Now prepare with the resolved URL
+                PrepareInternal();
+
+                if (_playAfterResolve)
+                {
+                    _playAfterResolve = false;
+                    // Play will be called after prepare completes
+                }
+            }
+            catch (Exception ex)
+            {
+                HandleError($"Stream resolution exception: {ex.Message}");
+            }
+        }
+
+        private void PrepareInternal()
+        {
             _state = PrismState.Preparing;
             _videoPlayer.isLooping = _loop;
             _videoPlayer.playbackSpeed = _playbackSpeed;
@@ -167,12 +295,18 @@ namespace Prism
                     _videoPlayer.source = VideoSource.VideoClip;
                     _videoPlayer.clip = _videoClip;
                     break;
+
                 case PrismSourceType.Url:
                     _videoPlayer.source = VideoSource.Url;
                     _videoPlayer.url = _url;
                     break;
+
+                case PrismSourceType.Stream:
+                    _videoPlayer.source = VideoSource.Url;
+                    _videoPlayer.url = _resolvedUrl ?? _url;
+                    break;
+
                 case PrismSourceType.WebRTC:
-                    // WebRTC handling will be implemented separately
                     Debug.LogWarning("[Prism] WebRTC source not yet implemented.");
                     return;
             }
@@ -180,19 +314,12 @@ namespace Prism
             _videoPlayer.Prepare();
         }
 
-        public void Play()
+        private void HandleError(string message)
         {
-            if (_state == PrismState.Idle)
-            {
-                Prepare();
-                return;
-            }
-
-            if (_state == PrismState.Ready || _state == PrismState.Paused)
-            {
-                _videoPlayer.Play();
-                _state = PrismState.Playing;
-            }
+            _state = PrismState.Error;
+            _playAfterResolve = false;
+            Debug.LogError($"[Prism] {message}");
+            OnError?.Invoke(message);
         }
 
         public void Pause()
@@ -209,12 +336,13 @@ namespace Prism
         {
             _videoPlayer.Stop();
             _state = PrismState.Idle;
+            _playAfterResolve = false;
             OnStopped?.Invoke();
         }
 
         public void Seek(double timeSeconds)
         {
-            if (_videoPlayer.canSetTime)
+            if (_videoPlayer.canSetTime && !IsLiveStream)
             {
                 _videoPlayer.time = Mathf.Clamp((float)timeSeconds, 0f, (float)Duration);
             }
@@ -257,8 +385,9 @@ namespace Prism
             _state = PrismState.Ready;
             OnPrepared?.Invoke();
 
-            if (_playOnAwake)
+            if (_playOnAwake || _playAfterResolve)
             {
+                _playAfterResolve = false;
                 Play();
             }
         }
@@ -281,9 +410,7 @@ namespace Prism
 
         private void OnVideoError(VideoPlayer source, string message)
         {
-            _state = PrismState.Error;
-            Debug.LogError($"[Prism] Video error: {message}");
-            OnError?.Invoke(message);
+            HandleError($"Video error: {message}");
         }
     }
 }
