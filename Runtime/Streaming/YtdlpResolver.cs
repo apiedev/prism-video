@@ -27,6 +27,7 @@ namespace Prism.Streaming
         };
 
         private string _ytdlpPath;
+        private bool _downloadAttempted;
 
         public string Name { get { return "yt-dlp"; } }
         public string YtdlpPath { get { return _ytdlpPath; } }
@@ -35,10 +36,11 @@ namespace Prism.Streaming
         public YtdlpResolver()
         {
             _ytdlpPath = FindYtdlp();
+            _downloadAttempted = false;
+
             if (string.IsNullOrEmpty(_ytdlpPath))
             {
-                Debug.LogWarning("[Prism] yt-dlp not found. YouTube/Twitch streaming will not work. " +
-                    "Install from: https://github.com/yt-dlp/yt-dlp");
+                Debug.Log("[Prism] yt-dlp not found locally. Will attempt to download on first use.");
             }
             else
             {
@@ -49,13 +51,49 @@ namespace Prism.Streaming
         public YtdlpResolver(string customPath)
         {
             _ytdlpPath = customPath;
+            _downloadAttempted = false;
+        }
+
+        public async Task<bool> EnsureAvailableAsync(Action<float> onProgress = null)
+        {
+            if (IsAvailable)
+            {
+                return true;
+            }
+
+            if (_downloadAttempted)
+            {
+                return false;
+            }
+
+            _downloadAttempted = true;
+            Debug.Log("[Prism] Downloading yt-dlp...");
+
+            DownloadResult result = await YtdlpDownloader.DownloadAsync(onProgress);
+
+            if (result.Success)
+            {
+                _ytdlpPath = result.InstallPath;
+                return true;
+            }
+
+            Debug.LogError("[Prism] Failed to download yt-dlp: " + result.Error);
+            return false;
+        }
+
+        public void RefreshPath()
+        {
+            _ytdlpPath = FindYtdlp();
+            _downloadAttempted = false;
         }
 
         public bool CanResolve(string url)
         {
-            if (string.IsNullOrEmpty(url) || !IsAvailable)
+            if (string.IsNullOrEmpty(url))
                 return false;
 
+            // We can resolve known hosts even if yt-dlp isn't installed yet
+            // (we'll download it on demand)
             try
             {
                 Uri uri = new Uri(url);
@@ -77,9 +115,14 @@ namespace Prism.Streaming
 
         public async Task<StreamInfo> ResolveAsync(string url, StreamQuality quality = StreamQuality.Auto)
         {
+            // Try to download yt-dlp if not available
             if (!IsAvailable)
             {
-                return new StreamInfo { Error = "yt-dlp not found" };
+                bool downloaded = await EnsureAvailableAsync();
+                if (!downloaded)
+                {
+                    return new StreamInfo { Error = "yt-dlp not found and download failed. Check your internet connection." };
+                }
             }
 
             try

@@ -69,20 +69,7 @@ namespace Prism.Editor
                         MessageType.Info);
 
                     // Show yt-dlp status
-                    bool ytdlpAvailable = StreamResolverFactory.IsYtdlpAvailable;
-                    if (!ytdlpAvailable)
-                    {
-                        EditorGUILayout.HelpBox(
-                            "yt-dlp not found! Install from: https://github.com/yt-dlp/yt-dlp\n" +
-                            "Windows: winget install yt-dlp\n" +
-                            "Mac: brew install yt-dlp\n" +
-                            "Linux: sudo apt install yt-dlp",
-                            MessageType.Warning);
-                    }
-                    else
-                    {
-                        EditorGUILayout.HelpBox($"yt-dlp found at: {StreamResolverFactory.YtdlpResolver.YtdlpPath}", MessageType.None);
-                    }
+                    DrawYtdlpStatus();
                     break;
 
                 case PrismSourceType.WebRTC:
@@ -201,6 +188,85 @@ namespace Prism.Editor
             }
 
             serializedObject.ApplyModifiedProperties();
+        }
+
+        private void DrawYtdlpStatus()
+        {
+            bool ytdlpAvailable = StreamResolverFactory.IsYtdlpAvailable;
+            bool isInstalled = YtdlpDownloader.IsInstalled();
+
+            EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+
+            if (ytdlpAvailable)
+            {
+                EditorGUILayout.BeginHorizontal();
+                EditorGUILayout.LabelField("yt-dlp Status:", "Installed", EditorStyles.boldLabel);
+                EditorGUILayout.EndHorizontal();
+
+                EditorGUILayout.LabelField("Path:", StreamResolverFactory.YtdlpResolver.YtdlpPath, EditorStyles.miniLabel);
+
+                EditorGUILayout.BeginHorizontal();
+                if (GUILayout.Button("Refresh", EditorStyles.miniButton, GUILayout.Width(60)))
+                {
+                    StreamResolverFactory.YtdlpResolver.RefreshPath();
+                }
+                if (isInstalled && GUILayout.Button("Delete", EditorStyles.miniButton, GUILayout.Width(60)))
+                {
+                    if (EditorUtility.DisplayDialog("Delete yt-dlp",
+                        "Are you sure you want to delete the bundled yt-dlp?", "Delete", "Cancel"))
+                    {
+                        YtdlpDownloader.Delete();
+                        StreamResolverFactory.YtdlpResolver.RefreshPath();
+                    }
+                }
+                EditorGUILayout.EndHorizontal();
+            }
+            else
+            {
+                EditorGUILayout.BeginHorizontal();
+                EditorGUILayout.LabelField("yt-dlp Status:", "Not Found", EditorStyles.boldLabel);
+                EditorGUILayout.EndHorizontal();
+
+                EditorGUILayout.LabelField("yt-dlp will be downloaded automatically on first use, or you can download it now:",
+                    EditorStyles.wordWrappedMiniLabel);
+
+                if (GUILayout.Button("Download yt-dlp Now"))
+                {
+                    DownloadYtdlpWithProgress();
+                }
+            }
+
+            EditorGUILayout.EndVertical();
+        }
+
+        private void DownloadYtdlpWithProgress()
+        {
+            EditorUtility.DisplayProgressBar("Downloading yt-dlp", "Starting download...", 0f);
+
+            try
+            {
+                DownloadResult result = YtdlpDownloader.DownloadSync((progress) =>
+                {
+                    EditorUtility.DisplayProgressBar("Downloading yt-dlp",
+                        "Downloading... " + (int)(progress * 100) + "%", progress);
+                });
+
+                if (result.Success)
+                {
+                    StreamResolverFactory.YtdlpResolver.RefreshPath();
+                    EditorUtility.DisplayDialog("Download Complete",
+                        "yt-dlp has been downloaded successfully to:\n" + result.InstallPath, "OK");
+                }
+                else
+                {
+                    EditorUtility.DisplayDialog("Download Failed",
+                        "Failed to download yt-dlp:\n" + result.Error, "OK");
+                }
+            }
+            finally
+            {
+                EditorUtility.ClearProgressBar();
+            }
         }
     }
 }
