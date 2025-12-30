@@ -333,7 +333,8 @@ namespace Prism.FFmpeg
             {
                 string error = PrismFFmpegBridge.GetErrorMessage(_player);
                 Debug.LogError("[PrismFFmpeg] Failed to open: " + error);
-                OnError.Invoke(error);
+                if (OnError != null)
+                    OnError.Invoke(error);
                 return;
             }
 
@@ -359,7 +360,8 @@ namespace Prism.FFmpeg
             }
 
             _lastState = State;
-            OnPrepared.Invoke();
+            if (OnPrepared != null)
+                OnPrepared.Invoke();
 
             // Auto-play if configured
             if (_playOnAwake)
@@ -693,7 +695,8 @@ namespace Prism.FFmpeg
             {
                 string error = "Resolution failed: " + task.Exception.Message;
                 Debug.LogError("[PrismFFmpeg] " + error);
-                OnError.Invoke(error);
+                if (OnError != null)
+                    OnError.Invoke(error);
                 yield break;
             }
 
@@ -703,7 +706,8 @@ namespace Prism.FFmpeg
             if (!info.Success)
             {
                 Debug.LogError("[PrismFFmpeg] Resolution failed: " + info.Error);
-                OnError.Invoke(info.Error);
+                if (OnError != null)
+                    OnError.Invoke(info.Error);
                 yield break;
             }
 
@@ -721,19 +725,23 @@ namespace Prism.FFmpeg
             switch (newState)
             {
                 case PrismFFmpegBridge.PrismState.Playing:
-                    OnStarted.Invoke();
+                    if (OnStarted != null)
+                        OnStarted.Invoke();
                     break;
 
                 case PrismFFmpegBridge.PrismState.Paused:
-                    OnPaused.Invoke();
+                    if (OnPaused != null)
+                        OnPaused.Invoke();
                     break;
 
                 case PrismFFmpegBridge.PrismState.Stopped:
-                    OnStopped.Invoke();
+                    if (OnStopped != null)
+                        OnStopped.Invoke();
                     break;
 
                 case PrismFFmpegBridge.PrismState.EndOfFile:
-                    OnFinished.Invoke();
+                    if (OnFinished != null)
+                        OnFinished.Invoke();
                     if (_loop)
                     {
                         Seek(0);
@@ -744,7 +752,8 @@ namespace Prism.FFmpeg
                 case PrismFFmpegBridge.PrismState.Error:
                     string error = PrismFFmpegBridge.GetErrorMessage(_player);
                     Debug.LogError("[PrismFFmpeg] Error: " + error);
-                    OnError.Invoke(error);
+                    if (OnError != null)
+                        OnError.Invoke(error);
                     break;
             }
         }
