@@ -129,26 +129,33 @@ namespace Prism.Streaming
             {
                 int height = quality.ToHeight();
                 string formatArg;
-                if (height > 0)
-                {
-                    formatArg = "bestvideo[height<=" + height + "][ext=mp4]+bestaudio[ext=m4a]/best[height<=" + height + "][ext=mp4]/best";
-                }
-                else
-                {
-                    formatArg = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best";
-                }
 
-                // For live streams, we need different handling
+                // Check if this is a live stream first
                 bool isLive = await CheckIfLiveAsync(url);
+
                 if (isLive)
                 {
+                    // Live streams - try to get a direct URL, avoid HLS if possible
+                    // Note: Most live streams only offer HLS which Unity can't play on Windows
                     if (height > 0)
                     {
-                        formatArg = "best[height<=" + height + "]/best";
+                        formatArg = "best[height<=" + height + "][protocol!=m3u8]/best[height<=" + height + "][protocol!=m3u8_native]/best[height<=" + height + "]";
                     }
                     else
                     {
-                        formatArg = "best";
+                        formatArg = "best[protocol!=m3u8]/best[protocol!=m3u8_native]/best";
+                    }
+                }
+                else
+                {
+                    // VODs - strongly prefer MP4, avoid HLS/DASH
+                    if (height > 0)
+                    {
+                        formatArg = "bestvideo[height<=" + height + "][ext=mp4][protocol!=m3u8]+bestaudio[ext=m4a]/best[height<=" + height + "][ext=mp4][protocol!=m3u8]/best[height<=" + height + "][ext=mp4]/best[ext=mp4]/best";
+                    }
+                    else
+                    {
+                        formatArg = "bestvideo[ext=mp4][protocol!=m3u8]+bestaudio[ext=m4a]/best[ext=mp4][protocol!=m3u8]/best[ext=mp4]/best";
                     }
                 }
 
@@ -167,6 +174,19 @@ namespace Prism.Streaming
                     return new StreamInfo { Error = "No URL returned from yt-dlp" };
                 }
 
+                // Check if we got an HLS stream (Unity can't play these on Windows)
+                bool isHls = directUrl.Contains(".m3u8") || directUrl.Contains("m3u8");
+                string format = isHls ? "HLS" : "MP4";
+                string warning = null;
+
+                if (isHls)
+                {
+                    #if UNITY_EDITOR_WIN || UNITY_STANDALONE_WIN
+                    warning = "HLS streams are not supported on Windows. Try a VOD or different source.";
+                    Debug.LogWarning("[Prism] " + warning);
+                    #endif
+                }
+
                 // Get additional info
                 StreamInfo info = await GetStreamInfoAsync(url);
 
@@ -177,7 +197,9 @@ namespace Prism.Streaming
                     Width = info.Width,
                     Height = info.Height,
                     IsLiveStream = isLive,
-                    Format = isLive ? "HLS" : "MP4"
+                    IsHls = isHls,
+                    Format = format,
+                    Warning = warning
                 };
             }
             catch (Exception ex)

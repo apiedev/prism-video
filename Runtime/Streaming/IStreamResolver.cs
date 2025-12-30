@@ -11,8 +11,10 @@ namespace Prism.Streaming
         public int Height { get; set; }
         public string Format { get; set; }
         public bool IsLiveStream { get; set; }
+        public bool IsHls { get; set; }
         public string Error { get; set; }
-        public bool Success => string.IsNullOrEmpty(Error) && !string.IsNullOrEmpty(DirectUrl);
+        public string Warning { get; set; }
+        public bool Success { get { return string.IsNullOrEmpty(Error) && !string.IsNullOrEmpty(DirectUrl); } }
     }
 
     public interface IStreamResolver
