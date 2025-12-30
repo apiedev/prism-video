@@ -574,33 +574,6 @@ namespace Prism.FFmpeg
                 Marshal.Copy(srcPtr, _videoFlipBuffer, dstOffset, rowBytes);
             }
 
-            // Horizontal flip (reverse each row's pixels)
-            for (int y = 0; y < height; y++)
-            {
-                int rowStart = y * rowBytes;
-                for (int x = 0; x < width / 2; x++)
-                {
-                    int leftIdx = rowStart + (x * 4);
-                    int rightIdx = rowStart + ((width - 1 - x) * 4);
-
-                    // Swap RGBA pixels
-                    byte tempR = _videoFlipBuffer[leftIdx];
-                    byte tempG = _videoFlipBuffer[leftIdx + 1];
-                    byte tempB = _videoFlipBuffer[leftIdx + 2];
-                    byte tempA = _videoFlipBuffer[leftIdx + 3];
-
-                    _videoFlipBuffer[leftIdx] = _videoFlipBuffer[rightIdx];
-                    _videoFlipBuffer[leftIdx + 1] = _videoFlipBuffer[rightIdx + 1];
-                    _videoFlipBuffer[leftIdx + 2] = _videoFlipBuffer[rightIdx + 2];
-                    _videoFlipBuffer[leftIdx + 3] = _videoFlipBuffer[rightIdx + 3];
-
-                    _videoFlipBuffer[rightIdx] = tempR;
-                    _videoFlipBuffer[rightIdx + 1] = tempG;
-                    _videoFlipBuffer[rightIdx + 2] = tempB;
-                    _videoFlipBuffer[rightIdx + 3] = tempA;
-                }
-            }
-
             // Load flipped data to texture
             _videoTexture.LoadRawTextureData(_videoFlipBuffer);
             _videoTexture.Apply(false);
