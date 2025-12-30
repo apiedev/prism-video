@@ -145,9 +145,22 @@ namespace Prism.Streaming
                 if (!string.IsNullOrEmpty(result.Output))
                 {
                     var lines = result.Output.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
-                    if (lines.Length >= 1) info.Title = lines[0];
-                    if (lines.Length >= 2) int.TryParse(lines[1], out var w); info.Width = 0;
-                    if (lines.Length >= 3) int.TryParse(lines[2], out var h); info.Height = 0;
+                    if (lines.Length >= 1)
+                    {
+                        info.Title = lines[0];
+                    }
+                    if (lines.Length >= 2)
+                    {
+                        int width;
+                        if (int.TryParse(lines[1], out width))
+                            info.Width = width;
+                    }
+                    if (lines.Length >= 3)
+                    {
+                        int height;
+                        if (int.TryParse(lines[2], out height))
+                            info.Height = height;
+                    }
                 }
             }
             catch
@@ -174,23 +187,25 @@ namespace Prism.Streaming
                         CreateNoWindow = true
                     };
 
-                    using var process = Process.Start(startInfo);
-                    if (process == null)
+                    using (var process = Process.Start(startInfo))
                     {
-                        return (null, "Failed to start yt-dlp process");
+                        if (process == null)
+                        {
+                            return (null, "Failed to start yt-dlp process");
+                        }
+
+                        var output = process.StandardOutput.ReadToEnd();
+                        var error = process.StandardError.ReadToEnd();
+
+                        process.WaitForExit(30000); // 30 second timeout
+
+                        if (process.ExitCode != 0 && !string.IsNullOrEmpty(error))
+                        {
+                            return (null, error);
+                        }
+
+                        return (output, null);
                     }
-
-                    var output = process.StandardOutput.ReadToEnd();
-                    var error = process.StandardError.ReadToEnd();
-
-                    process.WaitForExit(30000); // 30 second timeout
-
-                    if (process.ExitCode != 0 && !string.IsNullOrEmpty(error))
-                    {
-                        return (null, error);
-                    }
-
-                    return (output, null);
                 }
                 catch (Exception ex)
                 {

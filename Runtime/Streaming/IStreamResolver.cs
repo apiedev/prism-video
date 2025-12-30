@@ -38,17 +38,17 @@ namespace Prism.Streaming
     {
         public static int ToHeight(this StreamQuality quality)
         {
-            return quality switch
+            switch (quality)
             {
-                StreamQuality.Low => 360,
-                StreamQuality.Medium => 480,
-                StreamQuality.High => 720,
-                StreamQuality.Full => 1080,
-                StreamQuality.QHD => 1440,
-                StreamQuality.UHD4K => 2160,
-                StreamQuality.UHD8K => 4320,
-                _ => 0 // Auto - let resolver decide
-            };
+                case StreamQuality.Low: return 360;
+                case StreamQuality.Medium: return 480;
+                case StreamQuality.High: return 720;
+                case StreamQuality.Full: return 1080;
+                case StreamQuality.QHD: return 1440;
+                case StreamQuality.UHD4K: return 2160;
+                case StreamQuality.UHD8K: return 4320;
+                default: return 0; // Auto - let resolver decide
+            }
         }
     }
 }
