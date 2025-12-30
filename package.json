@@ -1,0 +1,28 @@
+{
+  "name": "dev.apie.prism",
+  "version": "0.1.0",
+  "displayName": "Prism Video Player",
+  "description": "High-performance video player for Unity-based VR/XR events. Supports up to 8K video playback and WebRTC streaming for minimal latency.",
+  "unity": "2021.3",
+  "unityRelease": "0f1",
+  "keywords": [
+    "video",
+    "player",
+    "streaming",
+    "webrtc",
+    "vr",
+    "xr",
+    "8k"
+  ],
+  "author": {
+    "name": "Alec Pierce",
+    "url": "https://github.com/apiedev"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/apiedev/prism-video.git"
+  },
+  "dependencies": {},
+  "samples": []
+}
