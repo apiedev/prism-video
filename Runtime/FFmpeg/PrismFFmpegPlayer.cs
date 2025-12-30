@@ -59,6 +59,9 @@ namespace Prism.FFmpeg
         private float[] _audioBuffer;
         private AudioSource _audioSource;
 
+        // Video frame buffer for flipping
+        private byte[] _videoFlipBuffer;
+
         // Audio ring buffer for smooth playback
         private float[] _audioRingBuffer;
         private int _audioRingWritePos;
@@ -552,8 +555,54 @@ namespace Prism.FFmpeg
                 CreateVideoTexture(width, height);
             }
 
-            // Copy frame data to texture
-            _videoTexture.LoadRawTextureData(frameData, width * height * 4);
+            int frameSize = width * height * 4;
+            int rowBytes = width * 4;
+
+            // Ensure flip buffer is allocated
+            if (_videoFlipBuffer == null || _videoFlipBuffer.Length != frameSize)
+            {
+                _videoFlipBuffer = new byte[frameSize];
+            }
+
+            // Copy frame data with vertical flip (copy rows in reverse order)
+            for (int y = 0; y < height; y++)
+            {
+                int srcRow = y;
+                int dstRow = height - 1 - y;
+                IntPtr srcPtr = frameData + (srcRow * rowBytes);
+                int dstOffset = dstRow * rowBytes;
+                Marshal.Copy(srcPtr, _videoFlipBuffer, dstOffset, rowBytes);
+            }
+
+            // Horizontal flip (reverse each row's pixels)
+            for (int y = 0; y < height; y++)
+            {
+                int rowStart = y * rowBytes;
+                for (int x = 0; x < width / 2; x++)
+                {
+                    int leftIdx = rowStart + (x * 4);
+                    int rightIdx = rowStart + ((width - 1 - x) * 4);
+
+                    // Swap RGBA pixels
+                    byte tempR = _videoFlipBuffer[leftIdx];
+                    byte tempG = _videoFlipBuffer[leftIdx + 1];
+                    byte tempB = _videoFlipBuffer[leftIdx + 2];
+                    byte tempA = _videoFlipBuffer[leftIdx + 3];
+
+                    _videoFlipBuffer[leftIdx] = _videoFlipBuffer[rightIdx];
+                    _videoFlipBuffer[leftIdx + 1] = _videoFlipBuffer[rightIdx + 1];
+                    _videoFlipBuffer[leftIdx + 2] = _videoFlipBuffer[rightIdx + 2];
+                    _videoFlipBuffer[leftIdx + 3] = _videoFlipBuffer[rightIdx + 3];
+
+                    _videoFlipBuffer[rightIdx] = tempR;
+                    _videoFlipBuffer[rightIdx + 1] = tempG;
+                    _videoFlipBuffer[rightIdx + 2] = tempB;
+                    _videoFlipBuffer[rightIdx + 3] = tempA;
+                }
+            }
+
+            // Load flipped data to texture
+            _videoTexture.LoadRawTextureData(_videoFlipBuffer);
             _videoTexture.Apply(false);
 
             // Blit to render texture if set
