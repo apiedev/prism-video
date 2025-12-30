@@ -1,15 +1,12 @@
 {
-    "name": "Prism.Editor",
-    "rootNamespace": "Prism.Editor",
+    "name": "Prism.FFmpeg",
+    "rootNamespace": "Prism.FFmpeg",
     "references": [
-        "Prism.Runtime",
-        "Prism.FFmpeg"
+        "Prism"
     ],
-    "includePlatforms": [
-        "Editor"
-    ],
+    "includePlatforms": [],
     "excludePlatforms": [],
-    "allowUnsafeCode": false,
+    "allowUnsafeCode": true,
     "overrideReferences": false,
     "precompiledReferences": [],
     "autoReferenced": true,

@@ -1,6 +1,7 @@
 using UnityEngine;
 using UnityEditor;
 using Prism;
+using Prism.FFmpeg;
 
 namespace Prism.Editor
 {
@@ -90,6 +91,56 @@ namespace Prism.Editor
             Undo.RegisterCreatedObjectUndo(root, "Create Prism Test Setup");
 
             Debug.Log("[Prism] Test setup created with Big Buck Bunny sample video. Enter Play mode to test!");
+        }
+
+        // ============================================================================
+        // FFmpeg Player Menu Items
+        // ============================================================================
+
+        [MenuItem("GameObject/Prism/FFmpeg Player", false, 20)]
+        public static void CreateFFmpegPlayer()
+        {
+            GameObject playerObj = new GameObject("Prism FFmpeg Player");
+            playerObj.AddComponent<PrismFFmpegPlayer>();
+
+            Selection.activeGameObject = playerObj;
+            Undo.RegisterCreatedObjectUndo(playerObj, "Create Prism FFmpeg Player");
+
+            Debug.Log("[Prism] FFmpeg Player created. Set a URL and call Play().");
+        }
+
+        [MenuItem("GameObject/Prism/FFmpeg Player with Screen", false, 21)]
+        public static void CreateFFmpegPlayerWithScreen()
+        {
+            // Root object
+            GameObject root = new GameObject("Prism FFmpeg Setup");
+
+            // Player
+            GameObject playerObj = new GameObject("Player");
+            playerObj.transform.SetParent(root.transform);
+            PrismFFmpegPlayer player = playerObj.AddComponent<PrismFFmpegPlayer>();
+
+            // Screen
+            GameObject screen = GameObject.CreatePrimitive(PrimitiveType.Quad);
+            screen.name = "Screen";
+            screen.transform.SetParent(root.transform);
+            screen.transform.localPosition = new Vector3(0, 4.5f, 10f);
+            screen.transform.localScale = new Vector3(16f, 9f, 1f);
+            Object.DestroyImmediate(screen.GetComponent<Collider>());
+
+            // Material
+            Material mat = new Material(Shader.Find("Unlit/Texture"));
+            screen.GetComponent<MeshRenderer>().material = mat;
+
+            // Link player to renderer
+            SerializedObject so = new SerializedObject(player);
+            so.FindProperty("_targetRenderer").objectReferenceValue = screen.GetComponent<MeshRenderer>();
+            so.ApplyModifiedPropertiesWithoutUndo();
+
+            Selection.activeGameObject = root;
+            Undo.RegisterCreatedObjectUndo(root, "Create Prism FFmpeg Setup");
+
+            Debug.Log("[Prism] FFmpeg Player with Screen created. Set a URL and enter Play mode.");
         }
     }
 }

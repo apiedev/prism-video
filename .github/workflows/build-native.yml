@@ -1,0 +1,144 @@
+name: Build Native Plugin
+
+on:
+  push:
+    paths:
+      - 'Native/**'
+      - '.github/workflows/build-native.yml'
+  pull_request:
+    paths:
+      - 'Native/**'
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download FFmpeg
+        shell: pwsh
+        run: |
+          $ffmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip"
+          Invoke-WebRequest -Uri $ffmpegUrl -OutFile ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath .
+          $ffmpegDir = Get-ChildItem -Directory | Where-Object { $_.Name -like "ffmpeg-*" } | Select-Object -First 1
+          Move-Item -Path "$($ffmpegDir.FullName)/*" -Destination "Native/ffmpeg/windows" -Force
+          New-Item -ItemType Directory -Path "Native/ffmpeg/windows" -Force
+          Move-Item -Path "$($ffmpegDir.FullName)/include" -Destination "Native/ffmpeg/windows/" -Force
+          Move-Item -Path "$($ffmpegDir.FullName)/lib" -Destination "Native/ffmpeg/windows/" -Force
+          Move-Item -Path "$($ffmpegDir.FullName)/bin" -Destination "Native/ffmpeg/windows/" -Force
+
+      - name: Configure CMake
+        run: cmake -B Native/build -S Native -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        run: cmake --build Native/build --config Release
+
+      - name: Install
+        run: cmake --install Native/build --config Release
+
+      - name: Copy FFmpeg DLLs
+        shell: pwsh
+        run: |
+          Copy-Item "Native/ffmpeg/windows/bin/*.dll" -Destination "Plugins/Windows/x86_64/" -Force
+
+      - name: Upload Windows Plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-plugin
+          path: Plugins/Windows/x86_64/
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            libavcodec-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libswscale-dev \
+            libswresample-dev
+
+      - name: Configure CMake
+        run: cmake -B Native/build -S Native -DCMAKE_BUILD_TYPE=Release -DPRISM_USE_SYSTEM_FFMPEG=ON
+
+      - name: Build
+        run: cmake --build Native/build -j$(nproc)
+
+      - name: Install
+        run: cmake --install Native/build
+
+      - name: Upload Linux Plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-plugin
+          path: Plugins/Linux/x86_64/
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          brew install cmake ffmpeg
+
+      - name: Configure CMake
+        run: cmake -B Native/build -S Native -DCMAKE_BUILD_TYPE=Release -DPRISM_USE_SYSTEM_FFMPEG=ON
+
+      - name: Build
+        run: cmake --build Native/build -j$(sysctl -n hw.ncpu)
+
+      - name: Install
+        run: cmake --install Native/build
+
+      - name: Upload macOS Plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-plugin
+          path: Plugins/macOS/
+
+  commit-plugins:
+    needs: [build-windows, build-linux, build-macos]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Windows Plugin
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-plugin
+          path: Plugins/Windows/x86_64/
+
+      - name: Download Linux Plugin
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-plugin
+          path: Plugins/Linux/x86_64/
+
+      - name: Download macOS Plugin
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-plugin
+          path: Plugins/macOS/
+
+      - name: Commit and Push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Plugins/
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update native plugins [skip ci]"
+            git push
+          fi
