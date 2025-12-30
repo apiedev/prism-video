@@ -9,6 +9,12 @@ namespace Prism.Streaming
 {
     public class YtdlpResolver : IStreamResolver
     {
+        private class ProcessResult
+        {
+            public string Output;
+            public string Error;
+        }
+
         private static readonly string[] KnownHosts = {
             "youtube.com", "youtu.be", "www.youtube.com",
             "twitch.tv", "www.twitch.tv",
@@ -22,9 +28,9 @@ namespace Prism.Streaming
 
         private string _ytdlpPath;
 
-        public string Name => "yt-dlp";
-        public string YtdlpPath => _ytdlpPath;
-        public bool IsAvailable => !string.IsNullOrEmpty(_ytdlpPath);
+        public string Name { get { return "yt-dlp"; } }
+        public string YtdlpPath { get { return _ytdlpPath; } }
+        public bool IsAvailable { get { return !string.IsNullOrEmpty(_ytdlpPath); } }
 
         public YtdlpResolver()
         {
@@ -36,7 +42,7 @@ namespace Prism.Streaming
             }
             else
             {
-                Debug.Log($"[Prism] Found yt-dlp at: {_ytdlpPath}");
+                Debug.Log("[Prism] Found yt-dlp at: " + _ytdlpPath);
             }
         }
 
@@ -52,10 +58,10 @@ namespace Prism.Streaming
 
             try
             {
-                var uri = new Uri(url);
-                var host = uri.Host.ToLowerInvariant();
+                Uri uri = new Uri(url);
+                string host = uri.Host.ToLowerInvariant();
 
-                foreach (var knownHost in KnownHosts)
+                foreach (string knownHost in KnownHosts)
                 {
                     if (host.Contains(knownHost) || knownHost.Contains(host))
                         return true;
@@ -78,37 +84,48 @@ namespace Prism.Streaming
 
             try
             {
-                var height = quality.ToHeight();
-                var formatArg = height > 0
-                    ? $"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height}][ext=mp4]/best"
-                    : "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best";
-
-                // For live streams, we need different handling
-                var isLive = await CheckIfLiveAsync(url);
-                if (isLive)
+                int height = quality.ToHeight();
+                string formatArg;
+                if (height > 0)
                 {
-                    formatArg = height > 0
-                        ? $"best[height<={height}]/best"
-                        : "best";
+                    formatArg = "bestvideo[height<=" + height + "][ext=mp4]+bestaudio[ext=m4a]/best[height<=" + height + "][ext=mp4]/best";
+                }
+                else
+                {
+                    formatArg = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best";
                 }
 
-                var args = $"--no-warnings --no-check-certificate -f \"{formatArg}\" --get-url \"{url}\"";
+                // For live streams, we need different handling
+                bool isLive = await CheckIfLiveAsync(url);
+                if (isLive)
+                {
+                    if (height > 0)
+                    {
+                        formatArg = "best[height<=" + height + "]/best";
+                    }
+                    else
+                    {
+                        formatArg = "best";
+                    }
+                }
 
-                var result = await RunYtdlpAsync(args);
+                string args = "--no-warnings --no-check-certificate -f \"" + formatArg + "\" --get-url \"" + url + "\"";
+
+                ProcessResult result = await RunYtdlpAsync(args);
 
                 if (!string.IsNullOrEmpty(result.Error))
                 {
                     return new StreamInfo { Error = result.Error };
                 }
 
-                var directUrl = result.Output?.Trim();
+                string directUrl = result.Output != null ? result.Output.Trim() : null;
                 if (string.IsNullOrEmpty(directUrl))
                 {
                     return new StreamInfo { Error = "No URL returned from yt-dlp" };
                 }
 
                 // Get additional info
-                var info = await GetStreamInfoAsync(url);
+                StreamInfo info = await GetStreamInfoAsync(url);
 
                 return new StreamInfo
                 {
@@ -122,29 +139,30 @@ namespace Prism.Streaming
             }
             catch (Exception ex)
             {
-                return new StreamInfo { Error = $"Resolution failed: {ex.Message}" };
+                return new StreamInfo { Error = "Resolution failed: " + ex.Message };
             }
         }
 
         private async Task<bool> CheckIfLiveAsync(string url)
         {
-            var args = $"--no-warnings --no-check-certificate --print is_live \"{url}\"";
-            var result = await RunYtdlpAsync(args);
-            return result.Output?.Trim().ToLowerInvariant() == "true";
+            string args = "--no-warnings --no-check-certificate --print is_live \"" + url + "\"";
+            ProcessResult result = await RunYtdlpAsync(args);
+            string output = result.Output != null ? result.Output.Trim().ToLowerInvariant() : "";
+            return output == "true";
         }
 
         private async Task<StreamInfo> GetStreamInfoAsync(string url)
         {
-            var info = new StreamInfo();
+            StreamInfo info = new StreamInfo();
 
             try
             {
-                var args = $"--no-warnings --no-check-certificate --print title --print width --print height \"{url}\"";
-                var result = await RunYtdlpAsync(args);
+                string args = "--no-warnings --no-check-certificate --print title --print width --print height \"" + url + "\"";
+                ProcessResult result = await RunYtdlpAsync(args);
 
                 if (!string.IsNullOrEmpty(result.Output))
                 {
-                    var lines = result.Output.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+                    string[] lines = result.Output.Split(new char[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
                     if (lines.Length >= 1)
                     {
                         info.Title = lines[0];
@@ -171,13 +189,15 @@ namespace Prism.Streaming
             return info;
         }
 
-        private async Task<(string Output, string Error)> RunYtdlpAsync(string args)
+        private Task<ProcessResult> RunYtdlpAsync(string args)
         {
-            return await Task.Run(() =>
+            return Task.Run(() =>
             {
+                ProcessResult result = new ProcessResult();
+
                 try
                 {
-                    var startInfo = new ProcessStartInfo
+                    ProcessStartInfo startInfo = new ProcessStartInfo
                     {
                         FileName = _ytdlpPath,
                         Arguments = args,
@@ -187,29 +207,32 @@ namespace Prism.Streaming
                         CreateNoWindow = true
                     };
 
-                    using (var process = Process.Start(startInfo))
+                    using (Process process = Process.Start(startInfo))
                     {
                         if (process == null)
                         {
-                            return (null, "Failed to start yt-dlp process");
+                            result.Error = "Failed to start yt-dlp process";
+                            return result;
                         }
 
-                        var output = process.StandardOutput.ReadToEnd();
-                        var error = process.StandardError.ReadToEnd();
+                        result.Output = process.StandardOutput.ReadToEnd();
+                        string errorOutput = process.StandardError.ReadToEnd();
 
                         process.WaitForExit(30000); // 30 second timeout
 
-                        if (process.ExitCode != 0 && !string.IsNullOrEmpty(error))
+                        if (process.ExitCode != 0 && !string.IsNullOrEmpty(errorOutput))
                         {
-                            return (null, error);
+                            result.Error = errorOutput;
+                            return result;
                         }
 
-                        return (output, null);
+                        return result;
                     }
                 }
                 catch (Exception ex)
                 {
-                    return (null, ex.Message);
+                    result.Error = ex.Message;
+                    return result;
                 }
             });
         }
@@ -217,7 +240,7 @@ namespace Prism.Streaming
         private static string FindYtdlp()
         {
             // Check common locations
-            var candidates = new[]
+            string[] candidates = new string[]
             {
                 // Windows
                 Path.Combine(Application.dataPath, "StreamingAssets", "yt-dlp.exe"),
@@ -235,28 +258,35 @@ namespace Prism.Streaming
                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "bin", "yt-dlp"),
             };
 
-            foreach (var path in candidates)
+            foreach (string path in candidates)
             {
                 if (File.Exists(path))
                     return path;
             }
 
             // Try PATH
-            var pathEnv = Environment.GetEnvironmentVariable("PATH");
+            string pathEnv = Environment.GetEnvironmentVariable("PATH");
             if (!string.IsNullOrEmpty(pathEnv))
             {
-                var separator = Application.platform == RuntimePlatform.WindowsPlayer ||
-                               Application.platform == RuntimePlatform.WindowsEditor
-                    ? ';' : ':';
-
-                var paths = pathEnv.Split(separator);
-                var exeNames = new[] { "yt-dlp", "yt-dlp.exe" };
-
-                foreach (var dir in paths)
+                char separator;
+                if (Application.platform == RuntimePlatform.WindowsPlayer ||
+                    Application.platform == RuntimePlatform.WindowsEditor)
                 {
-                    foreach (var exe in exeNames)
+                    separator = ';';
+                }
+                else
+                {
+                    separator = ':';
+                }
+
+                string[] paths = pathEnv.Split(separator);
+                string[] exeNames = new string[] { "yt-dlp", "yt-dlp.exe" };
+
+                foreach (string dir in paths)
+                {
+                    foreach (string exe in exeNames)
                     {
-                        var fullPath = Path.Combine(dir, exe);
+                        string fullPath = Path.Combine(dir, exe);
                         if (File.Exists(fullPath))
                             return fullPath;
                     }
