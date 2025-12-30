@@ -21,13 +21,14 @@ jobs:
         run: |
           $ffmpegUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip"
           Invoke-WebRequest -Uri $ffmpegUrl -OutFile ffmpeg.zip
-          Expand-Archive -Path ffmpeg.zip -DestinationPath .
-          $ffmpegDir = Get-ChildItem -Directory | Where-Object { $_.Name -like "ffmpeg-*" } | Select-Object -First 1
-          Move-Item -Path "$($ffmpegDir.FullName)/*" -Destination "Native/ffmpeg/windows" -Force
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg-extract
+          $ffmpegDir = Get-ChildItem -Path ffmpeg-extract -Directory | Select-Object -First 1
           New-Item -ItemType Directory -Path "Native/ffmpeg/windows" -Force
-          Move-Item -Path "$($ffmpegDir.FullName)/include" -Destination "Native/ffmpeg/windows/" -Force
-          Move-Item -Path "$($ffmpegDir.FullName)/lib" -Destination "Native/ffmpeg/windows/" -Force
-          Move-Item -Path "$($ffmpegDir.FullName)/bin" -Destination "Native/ffmpeg/windows/" -Force
+          Copy-Item -Path "$($ffmpegDir.FullName)/include" -Destination "Native/ffmpeg/windows/" -Recurse -Force
+          Copy-Item -Path "$($ffmpegDir.FullName)/lib" -Destination "Native/ffmpeg/windows/" -Recurse -Force
+          Copy-Item -Path "$($ffmpegDir.FullName)/bin" -Destination "Native/ffmpeg/windows/" -Recurse -Force
+          Write-Host "FFmpeg extracted to Native/ffmpeg/windows/"
+          Get-ChildItem "Native/ffmpeg/windows/"
 
       - name: Configure CMake
         run: cmake -B Native/build -S Native -G "Visual Studio 17 2022" -A x64
