@@ -64,6 +64,7 @@ namespace Prism.FFmpeg
         private int _audioRingWritePos;
         private int _audioRingReadPos;
         private int _audioRingSize;
+        private int _audioMaxLatencySamples; // Max samples before we drop to catch up
         private readonly object _audioLock = new object();
         private bool _audioStarted;
 
@@ -593,7 +594,10 @@ namespace Prism.FFmpeg
             _audioRingReadPos = 0;
             _audioStarted = false;
 
-            Debug.Log("[PrismFFmpeg] Audio: " + sampleRate + " Hz, " + channels + " channels, ring buffer: " + _audioRingSize + " samples");
+            // Max latency before dropping frames (200ms)
+            _audioMaxLatencySamples = (sampleRate * channels) / 5;
+
+            Debug.Log("[PrismFFmpeg] Audio: " + sampleRate + " Hz, " + channels + " channels, max latency: " + (_audioMaxLatencySamples / channels / sampleRate * 1000f).ToString("F0") + "ms");
         }
 
         private void UpdateAudioBuffer()
@@ -604,17 +608,6 @@ namespace Prism.FFmpeg
             if (State != PrismFFmpegBridge.PrismState.Playing)
                 return;
 
-            // Calculate available space in ring buffer
-            int available;
-            lock (_audioLock)
-            {
-                int used = (_audioRingWritePos - _audioRingReadPos + _audioRingSize) % _audioRingSize;
-                available = _audioRingSize - used - 1;
-            }
-
-            if (available < _audioBuffer.Length)
-                return;
-
             // Get samples from native plugin
             IntPtr bufferPtr = _audioBufferHandle.AddrOfPinnedObject();
             int samplesRead = PrismFFmpegBridge.prism_player_get_audio_samples(_player, bufferPtr, _audioBuffer.Length);
@@ -623,17 +616,32 @@ namespace Prism.FFmpeg
             {
                 lock (_audioLock)
                 {
-                    for (int i = 0; i < samplesRead; i++)
+                    int used = (_audioRingWritePos - _audioRingReadPos + _audioRingSize) % _audioRingSize;
+
+                    // If buffer is getting too full (latency building up), drop old samples
+                    if (used + samplesRead > _audioMaxLatencySamples)
+                    {
+                        int toDrop = (used + samplesRead) - _audioMaxLatencySamples;
+                        _audioRingReadPos = (_audioRingReadPos + toDrop) % _audioRingSize;
+                        // Recalculate used after dropping
+                        used = (_audioRingWritePos - _audioRingReadPos + _audioRingSize) % _audioRingSize;
+                    }
+
+                    // Write new samples
+                    int available = _audioRingSize - used - 1;
+                    int toWrite = Math.Min(samplesRead, available);
+
+                    for (int i = 0; i < toWrite; i++)
                     {
                         _audioRingBuffer[_audioRingWritePos] = _audioBuffer[i];
                         _audioRingWritePos = (_audioRingWritePos + 1) % _audioRingSize;
                     }
 
-                    // Start audio playback once we have enough buffered (100ms)
+                    // Start audio playback once we have some data buffered (50ms)
                     if (!_audioStarted)
                     {
                         int buffered = (_audioRingWritePos - _audioRingReadPos + _audioRingSize) % _audioRingSize;
-                        if (buffered > _audioRingSize / 5)
+                        if (buffered > _audioMaxLatencySamples / 4)
                         {
                             _audioStarted = true;
                             _audioSource.Play();
