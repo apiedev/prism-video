@@ -2,7 +2,7 @@
     "name": "Prism.FFmpeg",
     "rootNamespace": "Prism.FFmpeg",
     "references": [
-        "Prism"
+        "Prism.Runtime"
     ],
     "includePlatforms": [],
     "excludePlatforms": [],
