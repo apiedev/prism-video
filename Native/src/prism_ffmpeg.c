@@ -37,6 +37,17 @@
  * Internal Structures
  * ========================================================================== */
 
+/* Video frame queue entry */
+#define VIDEO_QUEUE_SIZE 8
+typedef struct {
+    uint8_t* data;
+    int width;
+    int height;
+    int stride;
+    double pts;
+    bool valid;
+} VideoFrameEntry;
+
 struct PrismPlayer {
     /* FFmpeg contexts */
     AVFormatContext* format_ctx;
@@ -49,12 +60,26 @@ struct PrismPlayer {
     int video_stream_idx;
     int audio_stream_idx;
 
-    /* Frames and packets */
+    /* Frames and packets (used by decoder thread) */
     AVFrame* frame;
     AVFrame* rgb_frame;
     AVPacket* packet;
-    uint8_t* video_buffer;
+    uint8_t* video_buffer;          /* Temp buffer for frame conversion in decoder thread */
     int video_buffer_size;
+
+    /* Video frame queue (thread-safe) */
+    VideoFrameEntry video_queue[VIDEO_QUEUE_SIZE];
+    int video_queue_write;
+    int video_queue_read;
+    int video_queue_count;
+
+    /* Current display frame (for main thread) */
+    uint8_t* display_buffer;
+    int display_width;
+    int display_height;
+    int display_stride;
+    double display_pts;
+    bool display_ready;
 
     /* Audio ring buffer for proper queuing */
     float* audio_buffer;
@@ -91,8 +116,6 @@ struct PrismPlayer {
     int video_width;
     int video_height;
     int video_stride;
-    bool has_new_frame;
-    bool frame_ready;               /* Frame is ready to display based on timing */
     bool first_frame_decoded;       /* Track if we've decoded the first frame */
 
     /* Callbacks */
@@ -101,11 +124,24 @@ struct PrismPlayer {
     PrismAudioSamplesCallback audio_callback;
     void* audio_callback_user_data;
 
-    /* Thread safety */
+    /* Decoder thread */
 #ifdef _WIN32
-    CRITICAL_SECTION lock;
+    HANDLE decoder_thread;
+    HANDLE stop_event;
+    CRITICAL_SECTION queue_lock;
 #else
-    pthread_mutex_t lock;
+    pthread_t decoder_thread;
+    bool stop_requested;
+    pthread_mutex_t queue_lock;
+    pthread_cond_t queue_cond;
+#endif
+    bool decoder_running;
+
+    /* Thread safety for state */
+#ifdef _WIN32
+    CRITICAL_SECTION state_lock;
+#else
+    pthread_mutex_t state_lock;
 #endif
 };
 
@@ -138,20 +174,289 @@ static void set_error(PrismPlayer* player, PrismError error, const char* message
     }
 }
 
-static void lock_player(PrismPlayer* player) {
+static void lock_state(PrismPlayer* player) {
 #ifdef _WIN32
-    EnterCriticalSection(&player->lock);
+    EnterCriticalSection(&player->state_lock);
 #else
-    pthread_mutex_lock(&player->lock);
+    pthread_mutex_lock(&player->state_lock);
 #endif
 }
 
-static void unlock_player(PrismPlayer* player) {
+static void unlock_state(PrismPlayer* player) {
 #ifdef _WIN32
-    LeaveCriticalSection(&player->lock);
+    LeaveCriticalSection(&player->state_lock);
 #else
-    pthread_mutex_unlock(&player->lock);
+    pthread_mutex_unlock(&player->state_lock);
 #endif
+}
+
+static void lock_queue(PrismPlayer* player) {
+#ifdef _WIN32
+    EnterCriticalSection(&player->queue_lock);
+#else
+    pthread_mutex_lock(&player->queue_lock);
+#endif
+}
+
+static void unlock_queue(PrismPlayer* player) {
+#ifdef _WIN32
+    LeaveCriticalSection(&player->queue_lock);
+#else
+    pthread_mutex_unlock(&player->queue_lock);
+#endif
+}
+
+/* Forward declaration */
+static void stop_decoder_thread(PrismPlayer* player);
+
+/* Decoder thread function */
+#ifdef _WIN32
+static DWORD WINAPI decoder_thread_func(LPVOID arg) {
+#else
+static void* decoder_thread_func(void* arg) {
+#endif
+    PrismPlayer* player = (PrismPlayer*)arg;
+    AVPacket* packet = av_packet_alloc();
+    AVFrame* frame = av_frame_alloc();
+    AVFrame* rgb_frame = av_frame_alloc();
+
+    prism_log(1, "Decoder thread started");
+
+    while (1) {
+        /* Check if we should stop */
+#ifdef _WIN32
+        if (WaitForSingleObject(player->stop_event, 0) == WAIT_OBJECT_0) {
+            break;
+        }
+#else
+        lock_state(player);
+        bool should_stop = player->stop_requested;
+        unlock_state(player);
+        if (should_stop) {
+            break;
+        }
+#endif
+
+        /* Check player state */
+        lock_state(player);
+        PrismState current_state = player->state;
+        unlock_state(player);
+
+        if (current_state != PRISM_STATE_PLAYING) {
+            /* Sleep a bit when not playing */
+#ifdef _WIN32
+            Sleep(10);
+#else
+            usleep(10000);
+#endif
+            continue;
+        }
+
+        /* Check if video queue is full */
+        lock_queue(player);
+        bool queue_full = (player->video_queue_count >= VIDEO_QUEUE_SIZE - 1);
+        /* Also check audio buffer */
+        bool audio_full = (player->audio_stream_idx < 0) ||
+                          (player->audio_available > player->audio_buffer_size * 3 / 4);
+        unlock_queue(player);
+
+        if (queue_full && audio_full) {
+            /* Buffers are full, wait a bit */
+#ifdef _WIN32
+            Sleep(5);
+#else
+            usleep(5000);
+#endif
+            continue;
+        }
+
+        /* Read a packet */
+        int ret = av_read_frame(player->format_ctx, packet);
+
+        if (ret < 0) {
+            if (ret == AVERROR_EOF) {
+                lock_state(player);
+                if (player->loop && !player->is_live) {
+                    /* Loop back to start */
+                    av_seek_frame(player->format_ctx, -1, 0, AVSEEK_FLAG_BACKWARD);
+                    if (player->video_codec_ctx) avcodec_flush_buffers(player->video_codec_ctx);
+                    if (player->audio_codec_ctx) avcodec_flush_buffers(player->audio_codec_ctx);
+                    player->playback_start_time = av_gettime();
+                    player->start_pts = 0;
+                    player->current_pts = 0;
+                    player->first_frame_decoded = false;
+                    unlock_state(player);
+                    continue;
+                } else {
+                    player->state = PRISM_STATE_END_OF_FILE;
+                    unlock_state(player);
+                    break;
+                }
+            }
+            /* Other error or EAGAIN, just continue */
+            av_packet_unref(packet);
+            continue;
+        }
+
+        /* Video packet */
+        if (packet->stream_index == player->video_stream_idx && player->video_codec_ctx) {
+            ret = avcodec_send_packet(player->video_codec_ctx, packet);
+            if (ret >= 0) {
+                ret = avcodec_receive_frame(player->video_codec_ctx, frame);
+                if (ret >= 0) {
+                    /* Get frame PTS */
+                    double frame_pts = 0;
+                    if (frame->pts != AV_NOPTS_VALUE) {
+                        frame_pts = frame->pts * player->video_time_base;
+                    } else if (frame->best_effort_timestamp != AV_NOPTS_VALUE) {
+                        frame_pts = frame->best_effort_timestamp * player->video_time_base;
+                    }
+
+                    /* Sync playback clock on first frame */
+                    lock_state(player);
+                    if (!player->first_frame_decoded) {
+                        player->first_frame_decoded = true;
+                        player->start_pts = frame_pts;
+                        player->playback_start_time = av_gettime();
+                        prism_log(1, "First video frame PTS: %.3f", frame_pts);
+                    }
+                    unlock_state(player);
+
+                    /* Convert to RGBA */
+                    sws_scale(player->sws_ctx,
+                        (const uint8_t* const*)frame->data, frame->linesize,
+                        0, player->video_height,
+                        player->rgb_frame->data, player->rgb_frame->linesize);
+
+                    /* Add to video queue */
+                    lock_queue(player);
+                    if (player->video_queue_count < VIDEO_QUEUE_SIZE) {
+                        int idx = player->video_queue_write;
+                        VideoFrameEntry* entry = &player->video_queue[idx];
+
+                        /* Allocate buffer if needed */
+                        int frame_size = player->video_width * player->video_height * 4;
+                        if (!entry->data) {
+                            entry->data = (uint8_t*)av_malloc(frame_size);
+                        }
+
+                        /* Copy frame data */
+                        memcpy(entry->data, player->rgb_frame->data[0], frame_size);
+                        entry->width = player->video_width;
+                        entry->height = player->video_height;
+                        entry->stride = player->video_stride;
+                        entry->pts = frame_pts;
+                        entry->valid = true;
+
+                        player->video_queue_write = (player->video_queue_write + 1) % VIDEO_QUEUE_SIZE;
+                        player->video_queue_count++;
+                    }
+                    unlock_queue(player);
+
+                    /* Update current PTS */
+                    lock_state(player);
+                    player->video_pts = frame_pts;
+                    player->current_pts = frame_pts;
+                    unlock_state(player);
+                }
+            }
+        }
+
+        /* Audio packet */
+        if (packet->stream_index == player->audio_stream_idx && player->audio_codec_ctx) {
+            ret = avcodec_send_packet(player->audio_codec_ctx, packet);
+            if (ret >= 0) {
+                AVFrame* audio_frame = av_frame_alloc();
+                ret = avcodec_receive_frame(player->audio_codec_ctx, audio_frame);
+                if (ret >= 0 && player->swr_ctx) {
+                    /* Get audio PTS */
+                    if (audio_frame->pts != AV_NOPTS_VALUE) {
+                        lock_state(player);
+                        player->audio_pts = audio_frame->pts * player->audio_time_base;
+                        unlock_state(player);
+                    }
+
+                    /* Convert to float samples */
+                    int out_samples = swr_get_out_samples(player->swr_ctx, audio_frame->nb_samples);
+                    float* temp_buffer = (float*)av_malloc(out_samples * 2 * sizeof(float));
+                    uint8_t* out_ptr = (uint8_t*)temp_buffer;
+
+                    int samples_converted = swr_convert(player->swr_ctx,
+                        &out_ptr, out_samples,
+                        (const uint8_t**)audio_frame->data, audio_frame->nb_samples);
+
+                    if (samples_converted > 0) {
+                        /* Write to audio ring buffer */
+                        lock_queue(player);
+                        for (int i = 0; i < samples_converted * 2; i++) {
+                            if (player->audio_available < player->audio_buffer_size) {
+                                player->audio_buffer[player->audio_write_pos] = temp_buffer[i];
+                                player->audio_write_pos = (player->audio_write_pos + 1) % player->audio_buffer_size;
+                                player->audio_available++;
+                            }
+                        }
+                        unlock_queue(player);
+                    }
+                    av_free(temp_buffer);
+                }
+                av_frame_free(&audio_frame);
+            }
+        }
+
+        av_packet_unref(packet);
+    }
+
+    av_packet_free(&packet);
+    av_frame_free(&frame);
+    av_frame_free(&rgb_frame);
+
+    prism_log(1, "Decoder thread stopped");
+
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+
+static void start_decoder_thread(PrismPlayer* player) {
+    if (player->decoder_running) {
+        return;
+    }
+
+#ifdef _WIN32
+    player->stop_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+    player->decoder_thread = CreateThread(NULL, 0, decoder_thread_func, player, 0, NULL);
+#else
+    player->stop_requested = false;
+    pthread_create(&player->decoder_thread, NULL, decoder_thread_func, player);
+#endif
+
+    player->decoder_running = true;
+    prism_log(1, "Started decoder thread");
+}
+
+static void stop_decoder_thread(PrismPlayer* player) {
+    if (!player->decoder_running) {
+        return;
+    }
+
+#ifdef _WIN32
+    SetEvent(player->stop_event);
+    WaitForSingleObject(player->decoder_thread, 2000);
+    CloseHandle(player->decoder_thread);
+    CloseHandle(player->stop_event);
+    player->decoder_thread = NULL;
+    player->stop_event = NULL;
+#else
+    lock_state(player);
+    player->stop_requested = true;
+    unlock_state(player);
+    pthread_join(player->decoder_thread, NULL);
+#endif
+
+    player->decoder_running = false;
+    prism_log(1, "Stopped decoder thread");
 }
 
 /* ============================================================================
@@ -211,12 +516,25 @@ PRISM_API PrismPlayer* prism_player_create(void) {
     player->speed = 1.0f;
     player->volume = 1.0f;
     player->use_hw_accel = false;
+    player->decoder_running = false;
 
+    /* Initialize locks */
 #ifdef _WIN32
-    InitializeCriticalSection(&player->lock);
+    InitializeCriticalSection(&player->state_lock);
+    InitializeCriticalSection(&player->queue_lock);
 #else
-    pthread_mutex_init(&player->lock, NULL);
+    pthread_mutex_init(&player->state_lock, NULL);
+    pthread_mutex_init(&player->queue_lock, NULL);
 #endif
+
+    /* Initialize video queue */
+    for (int i = 0; i < VIDEO_QUEUE_SIZE; i++) {
+        player->video_queue[i].data = NULL;
+        player->video_queue[i].valid = false;
+    }
+    player->video_queue_write = 0;
+    player->video_queue_read = 0;
+    player->video_queue_count = 0;
 
     prism_log(1, "Player created");
     return player;
@@ -229,10 +547,26 @@ PRISM_API void prism_player_destroy(PrismPlayer* player) {
 
     prism_player_close(player);
 
+    /* Free video queue buffers */
+    for (int i = 0; i < VIDEO_QUEUE_SIZE; i++) {
+        if (player->video_queue[i].data) {
+            av_free(player->video_queue[i].data);
+            player->video_queue[i].data = NULL;
+        }
+    }
+
+    /* Free display buffer */
+    if (player->display_buffer) {
+        av_free(player->display_buffer);
+        player->display_buffer = NULL;
+    }
+
 #ifdef _WIN32
-    DeleteCriticalSection(&player->lock);
+    DeleteCriticalSection(&player->state_lock);
+    DeleteCriticalSection(&player->queue_lock);
 #else
-    pthread_mutex_destroy(&player->lock);
+    pthread_mutex_destroy(&player->state_lock);
+    pthread_mutex_destroy(&player->queue_lock);
 #endif
 
     free(player);
@@ -252,10 +586,10 @@ PRISM_API int prism_player_open_with_options(PrismPlayer* player, const char* ur
         return PRISM_ERROR_INVALID_PARAMETER;
     }
 
-    lock_player(player);
-
-    /* Close any existing media */
+    /* Close any existing media (this also stops decoder thread) */
     prism_player_close(player);
+
+    lock_state(player);
 
     player->state = PRISM_STATE_OPENING;
     prism_log(1, "Opening: %s", url);
@@ -286,7 +620,7 @@ PRISM_API int prism_player_open_with_options(PrismPlayer* player, const char* ur
         char errbuf[256];
         av_strerror(ret, errbuf, sizeof(errbuf));
         set_error(player, PRISM_ERROR_OPEN_FAILED, errbuf);
-        unlock_player(player);
+        unlock_state(player);
         return PRISM_ERROR_OPEN_FAILED;
     }
 
@@ -295,7 +629,7 @@ PRISM_API int prism_player_open_with_options(PrismPlayer* player, const char* ur
     if (ret < 0) {
         set_error(player, PRISM_ERROR_OPEN_FAILED, "Could not find stream info");
         avformat_close_input(&player->format_ctx);
-        unlock_player(player);
+        unlock_state(player);
         return PRISM_ERROR_OPEN_FAILED;
     }
 
@@ -322,7 +656,7 @@ PRISM_API int prism_player_open_with_options(PrismPlayer* player, const char* ur
     if (player->video_stream_idx < 0 && player->audio_stream_idx < 0) {
         set_error(player, PRISM_ERROR_NO_VIDEO_STREAM, "No video or audio streams found");
         avformat_close_input(&player->format_ctx);
-        unlock_player(player);
+        unlock_state(player);
         return PRISM_ERROR_NO_VIDEO_STREAM;
     }
 
@@ -334,7 +668,7 @@ PRISM_API int prism_player_open_with_options(PrismPlayer* player, const char* ur
         if (!codec) {
             set_error(player, PRISM_ERROR_CODEC_NOT_FOUND, "Video codec not found");
             avformat_close_input(&player->format_ctx);
-            unlock_player(player);
+            unlock_state(player);
             return PRISM_ERROR_CODEC_NOT_FOUND;
         }
 
@@ -350,7 +684,7 @@ PRISM_API int prism_player_open_with_options(PrismPlayer* player, const char* ur
         if (ret < 0) {
             set_error(player, PRISM_ERROR_CODEC_OPEN_FAILED, "Could not open video codec");
             avformat_close_input(&player->format_ctx);
-            unlock_player(player);
+            unlock_state(player);
             return PRISM_ERROR_CODEC_OPEN_FAILED;
         }
 
@@ -440,7 +774,7 @@ PRISM_API int prism_player_open_with_options(PrismPlayer* player, const char* ur
     player->last_error = PRISM_OK;
     player->first_frame_decoded = false;
 
-    unlock_player(player);
+    unlock_state(player);
     prism_log(1, "Media opened successfully");
     return PRISM_OK;
 }
@@ -450,7 +784,10 @@ PRISM_API void prism_player_close(PrismPlayer* player) {
         return;
     }
 
-    lock_player(player);
+    /* Stop decoder thread first (must be done before acquiring lock) */
+    stop_decoder_thread(player);
+
+    lock_state(player);
 
     if (player->sws_ctx) {
         sws_freeContext(player->sws_ctx);
@@ -485,21 +822,36 @@ PRISM_API void prism_player_close(PrismPlayer* player) {
         av_packet_free(&player->packet);
     }
 
-    if (player->video_buffer) {
-        av_free(player->video_buffer);
-        player->video_buffer = NULL;
-    }
-
     if (player->audio_buffer) {
         av_free(player->audio_buffer);
         player->audio_buffer = NULL;
     }
 
+    if (player->video_buffer) {
+        av_free(player->video_buffer);
+        player->video_buffer = NULL;
+    }
+
+    /* Clear video queue */
+    lock_queue(player);
+    player->video_queue_write = 0;
+    player->video_queue_read = 0;
+    player->video_queue_count = 0;
+    for (int i = 0; i < VIDEO_QUEUE_SIZE; i++) {
+        player->video_queue[i].valid = false;
+    }
+    player->display_ready = false;
+    player->audio_available = 0;
+    player->audio_write_pos = 0;
+    player->audio_read_pos = 0;
+    unlock_queue(player);
+
     player->video_stream_idx = -1;
     player->audio_stream_idx = -1;
     player->state = PRISM_STATE_IDLE;
+    player->first_frame_decoded = false;
 
-    unlock_player(player);
+    unlock_state(player);
 }
 
 PRISM_API int prism_player_play(PrismPlayer* player) {
@@ -507,10 +859,12 @@ PRISM_API int prism_player_play(PrismPlayer* player) {
         return PRISM_ERROR_INVALID_PLAYER;
     }
 
-    lock_player(player);
+    lock_state(player);
 
-    if (player->state != PRISM_STATE_READY && player->state != PRISM_STATE_PAUSED) {
-        unlock_player(player);
+    if (player->state != PRISM_STATE_READY &&
+        player->state != PRISM_STATE_PAUSED &&
+        player->state != PRISM_STATE_STOPPED) {
+        unlock_state(player);
         return PRISM_ERROR_NOT_READY;
     }
 
@@ -518,7 +872,12 @@ PRISM_API int prism_player_play(PrismPlayer* player) {
     player->playback_start_time = av_gettime();
     player->start_pts = player->current_pts;
     player->state = PRISM_STATE_PLAYING;
-    unlock_player(player);
+    unlock_state(player);
+
+    /* Start decoder thread if not already running */
+    if (!player->decoder_running) {
+        start_decoder_thread(player);
+    }
 
     prism_log(1, "Playback started");
     return PRISM_OK;
@@ -529,13 +888,14 @@ PRISM_API int prism_player_pause(PrismPlayer* player) {
         return PRISM_ERROR_INVALID_PLAYER;
     }
 
-    lock_player(player);
+    lock_state(player);
 
     if (player->state == PRISM_STATE_PLAYING) {
         player->state = PRISM_STATE_PAUSED;
+        /* Note: decoder thread will notice the state change and sleep */
     }
 
-    unlock_player(player);
+    unlock_state(player);
     return PRISM_OK;
 }
 
@@ -544,7 +904,10 @@ PRISM_API int prism_player_stop(PrismPlayer* player) {
         return PRISM_ERROR_INVALID_PLAYER;
     }
 
-    lock_player(player);
+    /* Stop decoder thread first */
+    stop_decoder_thread(player);
+
+    lock_state(player);
 
     if (player->format_ctx) {
         av_seek_frame(player->format_ctx, -1, 0, AVSEEK_FLAG_BACKWARD);
@@ -557,9 +920,25 @@ PRISM_API int prism_player_stop(PrismPlayer* player) {
     }
 
     player->current_pts = 0;
+    player->first_frame_decoded = false;
     player->state = PRISM_STATE_STOPPED;
 
-    unlock_player(player);
+    unlock_state(player);
+
+    /* Clear queues */
+    lock_queue(player);
+    player->video_queue_write = 0;
+    player->video_queue_read = 0;
+    player->video_queue_count = 0;
+    for (int i = 0; i < VIDEO_QUEUE_SIZE; i++) {
+        player->video_queue[i].valid = false;
+    }
+    player->display_ready = false;
+    player->audio_available = 0;
+    player->audio_write_pos = 0;
+    player->audio_read_pos = 0;
+    unlock_queue(player);
+
     return PRISM_OK;
 }
 
@@ -572,13 +951,22 @@ PRISM_API int prism_player_seek(PrismPlayer* player, double position_seconds) {
         return PRISM_ERROR_SEEK_FAILED;  /* Can't seek in live streams */
     }
 
-    lock_player(player);
+    /* Stop decoder thread during seek to avoid race conditions */
+    bool was_running = player->decoder_running;
+    if (was_running) {
+        stop_decoder_thread(player);
+    }
+
+    lock_state(player);
 
     int64_t timestamp = (int64_t)(position_seconds * AV_TIME_BASE);
     int ret = av_seek_frame(player->format_ctx, -1, timestamp, AVSEEK_FLAG_BACKWARD);
 
     if (ret < 0) {
-        unlock_player(player);
+        unlock_state(player);
+        if (was_running && player->state == PRISM_STATE_PLAYING) {
+            start_decoder_thread(player);
+        }
         return PRISM_ERROR_SEEK_FAILED;
     }
 
@@ -591,10 +979,28 @@ PRISM_API int prism_player_seek(PrismPlayer* player, double position_seconds) {
 
     player->current_pts = position_seconds;
     player->first_frame_decoded = false;  /* Re-sync clock on next frame */
-    player->has_new_frame = false;
-    player->frame_ready = false;
 
-    unlock_player(player);
+    unlock_state(player);
+
+    /* Clear video queue and audio buffer */
+    lock_queue(player);
+    player->video_queue_write = 0;
+    player->video_queue_read = 0;
+    player->video_queue_count = 0;
+    for (int i = 0; i < VIDEO_QUEUE_SIZE; i++) {
+        player->video_queue[i].valid = false;
+    }
+    player->display_ready = false;
+    player->audio_available = 0;
+    player->audio_write_pos = 0;
+    player->audio_read_pos = 0;
+    unlock_queue(player);
+
+    /* Restart decoder thread if it was running */
+    if (was_running && player->state == PRISM_STATE_PLAYING) {
+        start_decoder_thread(player);
+    }
+
     return PRISM_OK;
 }
 
@@ -684,219 +1090,129 @@ static void audio_ring_write(PrismPlayer* player, float* samples, int count) {
 }
 
 PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
-    if (!player || player->state != PRISM_STATE_PLAYING) {
+    if (!player) {
         return 0;
     }
 
-    lock_player(player);
-
-    int frames_decoded = 0;
-    int ret;
-
-    /* Calculate current playback position based on wall clock */
-    int64_t elapsed_us = av_gettime() - player->playback_start_time;
-    double playback_time = player->start_pts + (elapsed_us / 1000000.0) * player->speed;
-
-    /* For live streams, be more aggressive - always try to catch up */
-    double time_diff = 0;
-    (void)time_diff;  /* May be unused depending on code path */
-
-    /* If no video stream, mark video as ready immediately */
-    bool video_ready = (player->video_stream_idx < 0);
-
-    /* For live streams, limit how much we try to decode per frame to avoid blocking Unity */
-    int max_iterations = player->is_live ? 10 : 50;
-    int max_packets_per_update = player->is_live ? 5 : 20;
-    int packets_read = 0;
-
-    /* Read and decode packets - continue until both video and audio are satisfied */
-    while (max_iterations-- > 0 && packets_read < max_packets_per_update) {
-        /* Check if current frame is ready for display */
-        if (player->has_new_frame && !video_ready) {
-            time_diff = player->video_pts - playback_time;
-
-            if (time_diff <= 0.016) {  /* Frame is due or late (within ~1 frame at 60fps) */
-                player->frame_ready = true;
-                frames_decoded = 1;
-                video_ready = true;
-
-                /* If we're significantly behind on a live stream, drop frames */
-                if (player->is_live && time_diff < -0.1) {
-                    player->has_new_frame = false;  /* Force decode next frame */
-                    video_ready = false;
-                    continue;
-                }
-                /* Don't break here - continue to fill audio buffer */
-            } else {
-                /* Frame is early - mark video as satisfied, don't decode more
-                 * The frame will be displayed on a future Update() call */
-                video_ready = true;
-            }
-        }
-
-        /* Check if we have enough audio buffered
-         * For live streams: accept less buffer (100ms) to avoid blocking
-         * For files: buffer more (500ms) for smoother playback */
-        int min_audio_buffer = player->is_live ?
-            (player->audio_buffer_size / 20) :  /* ~100ms for live */
-            (player->audio_buffer_size / 4);    /* ~500ms for files */
-        bool audio_satisfied = (player->audio_stream_idx < 0) ||
-                               (player->audio_available > min_audio_buffer);
-
-        /* If both video and audio are satisfied, we can stop */
-        if (video_ready && audio_satisfied) {
-            break;
-        }
-
-        /* Need to decode more frames */
-        ret = av_read_frame(player->format_ctx, player->packet);
-        packets_read++;
-
-        if (ret < 0) {
-            if (ret == AVERROR_EOF) {
-                if (player->loop && !player->is_live) {
-                    /* Loop back to start */
-                    av_seek_frame(player->format_ctx, -1, 0, AVSEEK_FLAG_BACKWARD);
-                    if (player->video_codec_ctx) avcodec_flush_buffers(player->video_codec_ctx);
-                    if (player->audio_codec_ctx) avcodec_flush_buffers(player->audio_codec_ctx);
-                    player->playback_start_time = av_gettime();
-                    player->start_pts = 0;
-                    player->current_pts = 0;
-                    player->first_frame_decoded = false;  /* Re-sync on loop */
-                    player->has_new_frame = false;
-                    player->frame_ready = false;
-                    continue;
-                } else {
-                    player->state = PRISM_STATE_END_OF_FILE;
-                    break;
-                }
-            }
-            break;
-        }
-
-        /* Video packet */
-        if (player->packet->stream_index == player->video_stream_idx && player->video_codec_ctx) {
-            /* Only decode video if we need it */
-            if (!video_ready || !player->has_new_frame) {
-                ret = avcodec_send_packet(player->video_codec_ctx, player->packet);
-                if (ret >= 0) {
-                    ret = avcodec_receive_frame(player->video_codec_ctx, player->frame);
-                    if (ret >= 0) {
-                        /* Get frame PTS */
-                        double frame_pts = 0;
-                        if (player->frame->pts != AV_NOPTS_VALUE) {
-                            frame_pts = player->frame->pts * player->video_time_base;
-                        } else if (player->frame->best_effort_timestamp != AV_NOPTS_VALUE) {
-                            frame_pts = player->frame->best_effort_timestamp * player->video_time_base;
-                        }
-
-                        /* Sync playback clock on first frame to handle non-zero start PTS */
-                        if (!player->first_frame_decoded) {
-                            player->first_frame_decoded = true;
-                            player->start_pts = frame_pts;
-                            player->playback_start_time = av_gettime();
-                            playback_time = frame_pts;  /* Update local var too */
-                            prism_log(1, "First video frame PTS: %.3f", frame_pts);
-                        }
-
-                        /* For non-live: skip frames that are too old */
-                        if (!player->is_live && frame_pts < playback_time - 0.5) {
-                            av_packet_unref(player->packet);
-                            continue;  /* Skip this frame, too old */
-                        }
-
-                        /* Convert to RGBA */
-                        sws_scale(player->sws_ctx,
-                            (const uint8_t* const*)player->frame->data, player->frame->linesize,
-                            0, player->video_height,
-                            player->rgb_frame->data, player->rgb_frame->linesize);
-
-                        player->video_pts = frame_pts;
-                        player->current_pts = frame_pts;
-                        player->has_new_frame = true;
-
-                        /* Call callback if set */
-                        if (player->video_callback) {
-                            player->video_callback(
-                                player->video_callback_user_data,
-                                player->video_buffer,
-                                player->video_width,
-                                player->video_height,
-                                player->video_stride,
-                                player->video_pts
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        /* Audio packet - always decode to keep buffer full */
-        if (player->packet->stream_index == player->audio_stream_idx && player->audio_codec_ctx) {
-            ret = avcodec_send_packet(player->audio_codec_ctx, player->packet);
-            if (ret >= 0) {
-                AVFrame* audio_frame = av_frame_alloc();
-                ret = avcodec_receive_frame(player->audio_codec_ctx, audio_frame);
-                if (ret >= 0 && player->swr_ctx) {
-                    /* Get audio PTS */
-                    if (audio_frame->pts != AV_NOPTS_VALUE) {
-                        player->audio_pts = audio_frame->pts * player->audio_time_base;
-                    }
-
-                    /* Convert to float samples */
-                    int out_samples = swr_get_out_samples(player->swr_ctx, audio_frame->nb_samples);
-                    float* temp_buffer = (float*)av_malloc(out_samples * 2 * sizeof(float));
-                    uint8_t* out_ptr = (uint8_t*)temp_buffer;
-
-                    int samples_converted = swr_convert(player->swr_ctx,
-                        &out_ptr, out_samples,
-                        (const uint8_t**)audio_frame->data, audio_frame->nb_samples);
-
-                    if (samples_converted > 0) {
-                        /* Write to ring buffer */
-                        audio_ring_write(player, temp_buffer, samples_converted * 2);
-
-                        /* Call callback if set */
-                        if (player->audio_callback) {
-                            player->audio_callback(
-                                player->audio_callback_user_data,
-                                temp_buffer,
-                                samples_converted,
-                                2,
-                                player->audio_pts
-                            );
-                        }
-                    }
-                    av_free(temp_buffer);
-                }
-                av_frame_free(&audio_frame);
-            }
-        }
-
-        av_packet_unref(player->packet);
+    /* Check state without holding lock for quick exit */
+    PrismState current_state = player->state;
+    if (current_state != PRISM_STATE_PLAYING && current_state != PRISM_STATE_END_OF_FILE) {
+        return 0;
     }
 
-    unlock_player(player);
-    return frames_decoded;
+    int frames_ready = 0;
+    (void)delta_time;  /* Using wall clock instead */
+
+    /* Calculate current playback position based on wall clock */
+    lock_state(player);
+    int64_t elapsed_us = av_gettime() - player->playback_start_time;
+    double playback_time = player->start_pts + (elapsed_us / 1000000.0) * player->speed;
+    bool is_live = player->is_live;
+    unlock_state(player);
+
+    /* Pull frames from video queue based on timing - this is non-blocking */
+    lock_queue(player);
+
+    while (player->video_queue_count > 0) {
+        int idx = player->video_queue_read;
+        VideoFrameEntry* entry = &player->video_queue[idx];
+
+        if (!entry->valid) {
+            /* Skip invalid entries */
+            player->video_queue_read = (player->video_queue_read + 1) % VIDEO_QUEUE_SIZE;
+            player->video_queue_count--;
+            continue;
+        }
+
+        double time_diff = entry->pts - playback_time;
+
+        /* For live streams, be more aggressive about displaying frames */
+        double display_threshold = is_live ? 0.05 : 0.016;
+
+        if (time_diff <= display_threshold) {
+            /* Frame is due or slightly late - copy to display buffer */
+
+            /* Allocate display buffer if needed */
+            int frame_size = entry->width * entry->height * 4;
+            if (!player->display_buffer) {
+                player->display_buffer = (uint8_t*)av_malloc(frame_size);
+            }
+
+            /* Copy frame data */
+            memcpy(player->display_buffer, entry->data, frame_size);
+            player->display_width = entry->width;
+            player->display_height = entry->height;
+            player->display_stride = entry->stride;
+            player->display_pts = entry->pts;
+            player->display_ready = true;
+
+            /* Mark entry as consumed */
+            entry->valid = false;
+            player->video_queue_read = (player->video_queue_read + 1) % VIDEO_QUEUE_SIZE;
+            player->video_queue_count--;
+
+            /* Update current PTS (need state lock) */
+            unlock_queue(player);
+            lock_state(player);
+            player->video_pts = player->display_pts;
+            player->current_pts = player->display_pts;
+            unlock_state(player);
+            lock_queue(player);
+
+            frames_ready = 1;
+
+            /* If significantly behind on live stream, keep dropping */
+            if (is_live && time_diff < -0.1) {
+                continue;  /* Drop more frames to catch up */
+            }
+
+            /* Call video callback if set */
+            if (player->video_callback) {
+                player->video_callback(
+                    player->video_callback_user_data,
+                    player->display_buffer,
+                    player->display_width,
+                    player->display_height,
+                    player->display_stride,
+                    player->display_pts
+                );
+            }
+
+            break;  /* One frame per update is enough */
+        } else {
+            /* Frame is early - wait for next update */
+            break;
+        }
+    }
+
+    unlock_queue(player);
+
+    return frames_ready;
 }
 
 PRISM_API uint8_t* prism_player_get_video_frame(PrismPlayer* player, int* out_width, int* out_height, int* out_stride) {
-    if (!player || !player->video_buffer) {
+    if (!player) {
         return NULL;
     }
 
-    /* Only return frame if it's ready to display based on timing */
-    if (!player->frame_ready) {
+    lock_queue(player);
+
+    /* Only return frame if display is ready */
+    if (!player->display_ready || !player->display_buffer) {
+        unlock_queue(player);
         return NULL;
     }
 
-    if (out_width) *out_width = player->video_width;
-    if (out_height) *out_height = player->video_height;
-    if (out_stride) *out_stride = player->video_stride;
+    if (out_width) *out_width = player->display_width;
+    if (out_height) *out_height = player->display_height;
+    if (out_stride) *out_stride = player->display_stride;
 
-    player->has_new_frame = false;
-    player->frame_ready = false;
-    return player->video_buffer;
+    /* Mark as consumed so we don't return the same frame twice */
+    player->display_ready = false;
+
+    unlock_queue(player);
+
+    return player->display_buffer;
 }
 
 PRISM_API double prism_player_get_video_pts(PrismPlayer* player) {
@@ -904,23 +1220,28 @@ PRISM_API double prism_player_get_video_pts(PrismPlayer* player) {
 }
 
 PRISM_API int prism_player_copy_video_frame(PrismPlayer* player, uint8_t* dest_buffer, int dest_stride) {
-    if (!player || !player->video_buffer || !dest_buffer) {
+    if (!player || !dest_buffer) {
         return PRISM_ERROR_INVALID_PARAMETER;
     }
 
-    lock_player(player);
+    lock_queue(player);
 
-    if (dest_stride == player->video_stride) {
-        memcpy(dest_buffer, player->video_buffer, player->video_height * player->video_stride);
+    if (!player->display_buffer || !player->display_ready) {
+        unlock_queue(player);
+        return PRISM_ERROR_INVALID_PARAMETER;
+    }
+
+    if (dest_stride == player->display_stride) {
+        memcpy(dest_buffer, player->display_buffer, player->display_height * player->display_stride);
     } else {
         /* Copy row by row if strides differ */
-        int copy_width = (dest_stride < player->video_stride) ? dest_stride : player->video_stride;
-        for (int y = 0; y < player->video_height; y++) {
-            memcpy(dest_buffer + y * dest_stride, player->video_buffer + y * player->video_stride, copy_width);
+        int copy_width = (dest_stride < player->display_stride) ? dest_stride : player->display_stride;
+        for (int y = 0; y < player->display_height; y++) {
+            memcpy(dest_buffer + y * dest_stride, player->display_buffer + y * player->display_stride, copy_width);
         }
     }
 
-    unlock_player(player);
+    unlock_queue(player);
     return PRISM_OK;
 }
 
@@ -933,7 +1254,7 @@ PRISM_API int prism_player_get_audio_samples(PrismPlayer* player, float* buffer,
         return 0;
     }
 
-    lock_player(player);
+    lock_queue(player);
 
     int to_copy = (player->audio_available < max_samples) ? player->audio_available : max_samples;
 
@@ -943,7 +1264,7 @@ PRISM_API int prism_player_get_audio_samples(PrismPlayer* player, float* buffer,
     }
     player->audio_available -= to_copy;
 
-    unlock_player(player);
+    unlock_queue(player);
     return to_copy;
 }
 
