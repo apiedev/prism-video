@@ -647,12 +647,14 @@ namespace Prism.FFmpeg
                         _audioRingWritePos = (_audioRingWritePos + 1) % _audioRingSize;
                     }
 
-                    // Start audio playback once we have enough data buffered (200ms)
+                    // Start audio playback once we have enough data buffered
+                    // For live streams, start sooner to reduce latency
                     if (!_audioStarted)
                     {
                         int buffered = (_audioRingWritePos - _audioRingReadPos + _audioRingSize) % _audioRingSize;
-                        // Wait for at least 200ms (40% of max latency) before starting playback
-                        if (buffered > _audioMaxLatencySamples * 2 / 5)
+                        // Start with at least 50ms of audio (lower threshold for responsiveness)
+                        int minBuffer = _audioRingSize / 20; // ~50ms
+                        if (buffered > minBuffer)
                         {
                             _audioStarted = true;
                             _audioSource.Play();

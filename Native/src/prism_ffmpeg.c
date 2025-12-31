@@ -701,11 +701,16 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
     double time_diff = 0;
     (void)time_diff;  /* May be unused depending on code path */
 
-    bool video_ready = false;
+    /* If no video stream, mark video as ready immediately */
+    bool video_ready = (player->video_stream_idx < 0);
+
+    /* For live streams, limit how much we try to decode per frame to avoid blocking Unity */
+    int max_iterations = player->is_live ? 10 : 50;
+    int max_packets_per_update = player->is_live ? 5 : 20;
+    int packets_read = 0;
 
     /* Read and decode packets - continue until both video and audio are satisfied */
-    int max_iterations = 100;  /* Prevent infinite loops */
-    while (max_iterations-- > 0) {
+    while (max_iterations-- > 0 && packets_read < max_packets_per_update) {
         /* Check if current frame is ready for display */
         if (player->has_new_frame && !video_ready) {
             time_diff = player->video_pts - playback_time;
@@ -729,9 +734,14 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
             }
         }
 
-        /* Check if we have enough audio buffered (at least 500ms ahead = 1/4 of 2 sec buffer) */
+        /* Check if we have enough audio buffered
+         * For live streams: accept less buffer (100ms) to avoid blocking
+         * For files: buffer more (500ms) for smoother playback */
+        int min_audio_buffer = player->is_live ?
+            (player->audio_buffer_size / 20) :  /* ~100ms for live */
+            (player->audio_buffer_size / 4);    /* ~500ms for files */
         bool audio_satisfied = (player->audio_stream_idx < 0) ||
-                               (player->audio_available > player->audio_buffer_size / 4);
+                               (player->audio_available > min_audio_buffer);
 
         /* If both video and audio are satisfied, we can stop */
         if (video_ready && audio_satisfied) {
@@ -740,6 +750,7 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
 
         /* Need to decode more frames */
         ret = av_read_frame(player->format_ctx, player->packet);
+        packets_read++;
 
         if (ret < 0) {
             if (ret == AVERROR_EOF) {
