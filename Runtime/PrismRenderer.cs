@@ -9,7 +9,7 @@ namespace Prism
         [SerializeField] private PrismPlayer _player;
 
         [Header("Material Settings")]
-        [SerializeField] private string _texturePropertyName = "_MainTex";
+        [SerializeField] private string _texturePropertyName = "_BaseMap"; // URP default (use _MainTex for built-in)
         [SerializeField] private string _emissionPropertyName = "_EmissionMap";
         [SerializeField] private bool _useEmission = true;
         [SerializeField] [Range(0f, 2f)] private float _emissionIntensity = 1f;

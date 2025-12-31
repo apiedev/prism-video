@@ -40,13 +40,22 @@ namespace Prism
             // Add renderer component
             _renderer = _screen.AddComponent<PrismRenderer>();
 
-            // Create unlit material for the screen
-            Material screenMat = new Material(Shader.Find("Unlit/Texture"));
+            // Create unlit material for the screen (URP compatible)
+            Shader unlitShader = Shader.Find("Universal Render Pipeline/Unlit");
+            if (unlitShader == null)
+            {
+                // Fallback for built-in render pipeline
+                unlitShader = Shader.Find("Unlit/Texture");
+            }
+            Material screenMat = new Material(unlitShader);
             _screen.GetComponent<MeshRenderer>().material = screenMat;
 
-            // Link renderer to player (will happen automatically via GetComponentInParent, but explicit is clearer)
-            var rendererField = typeof(PrismRenderer).GetField("_player", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            rendererField?.SetValue(_renderer, _player);
+            // Link renderer to player using SerializedObject for proper persistence
+#if UNITY_EDITOR
+            var so = new UnityEditor.SerializedObject(_renderer);
+            so.FindProperty("_player").objectReferenceValue = _player;
+            so.ApplyModifiedPropertiesWithoutUndo();
+#endif
 
             Debug.Log("[Prism] Test setup created! Enter Play mode to test.");
         }

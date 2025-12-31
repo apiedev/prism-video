@@ -29,8 +29,9 @@ namespace Prism.Editor
             // Remove collider
             Object.DestroyImmediate(screen.GetComponent<Collider>());
 
-            // Add unlit material
-            Material mat = new Material(Shader.Find("Unlit/Texture"));
+            // Add unlit material (URP compatible)
+            Shader unlitShader = Shader.Find("Universal Render Pipeline/Unlit") ?? Shader.Find("Unlit/Texture");
+            Material mat = new Material(unlitShader);
             screen.GetComponent<MeshRenderer>().material = mat;
 
             // Add renderer component
@@ -61,8 +62,9 @@ namespace Prism.Editor
             screen.transform.localScale = new Vector3(16f, 9f, 1f);
             Object.DestroyImmediate(screen.GetComponent<Collider>());
 
-            // Material
-            Material mat = new Material(Shader.Find("Unlit/Texture"));
+            // Material (URP compatible)
+            Shader unlitShader = Shader.Find("Universal Render Pipeline/Unlit") ?? Shader.Find("Unlit/Texture");
+            Material mat = new Material(unlitShader);
             screen.GetComponent<MeshRenderer>().material = mat;
 
             // Renderer with player reference
@@ -128,8 +130,9 @@ namespace Prism.Editor
             screen.transform.localScale = new Vector3(16f, 9f, 1f);
             Object.DestroyImmediate(screen.GetComponent<Collider>());
 
-            // Material
-            Material mat = new Material(Shader.Find("Unlit/Texture"));
+            // Material (URP compatible)
+            Shader unlitShader = Shader.Find("Universal Render Pipeline/Unlit") ?? Shader.Find("Unlit/Texture");
+            Material mat = new Material(unlitShader);
             screen.GetComponent<MeshRenderer>().material = mat;
 
             // Link player to renderer

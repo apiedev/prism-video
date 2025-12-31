@@ -31,7 +31,7 @@ namespace Prism.FFmpeg
         [Header("Output")]
         [SerializeField] private RenderTexture _targetTexture;
         [SerializeField] private Renderer _targetRenderer;
-        [SerializeField] private string _texturePropertyName = "_MainTex";
+        [SerializeField] private string _texturePropertyName = "_BaseMap"; // URP default (use _MainTex for built-in)
 
         [Header("Settings")]
         [SerializeField] private bool _useHardwareAcceleration = true;

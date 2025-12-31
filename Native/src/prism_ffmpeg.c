@@ -837,11 +837,17 @@ PRISM_API uint8_t* prism_player_get_video_frame(PrismPlayer* player, int* out_wi
         return NULL;
     }
 
+    /* Only return frame if it's ready to display based on timing */
+    if (!player->frame_ready) {
+        return NULL;
+    }
+
     if (out_width) *out_width = player->video_width;
     if (out_height) *out_height = player->video_height;
     if (out_stride) *out_stride = player->video_stride;
 
     player->has_new_frame = false;
+    player->frame_ready = false;
     return player->video_buffer;
 }
 
