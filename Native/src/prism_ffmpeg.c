@@ -1140,46 +1140,75 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
     lock_queue(player);
 
     if (is_live) {
-        /* LIVE STREAM MODE: Always show the newest frame, drop everything else */
-        VideoFrameEntry* newest_entry = NULL;
-        int newest_idx = -1;
+        /* LIVE STREAM MODE: Respect timing but skip to newest READY frame
+         * - Still use PTS timing so we don't play faster than stream rate
+         * - When behind, skip to newest frame that's due (drop old frames)
+         * - Cap latency by not buffering too far ahead
+         */
+        VideoFrameEntry* best_entry = NULL;
+        double max_latency = 0.2;  /* Max 200ms latency for live */
 
-        /* Find the newest valid frame and discard all others */
+        /* Find the newest frame that's ready to display */
         while (player->video_queue_count > 0) {
             int idx = player->video_queue_read;
             VideoFrameEntry* entry = &player->video_queue[idx];
 
-            if (entry->valid) {
-                /* If we had a previous newest, discard it */
-                if (newest_entry != NULL) {
-                    newest_entry->valid = false;
-                }
-                newest_entry = entry;
-                newest_idx = idx;
+            if (!entry->valid) {
+                player->video_queue_read = (player->video_queue_read + 1) % VIDEO_QUEUE_SIZE;
+                player->video_queue_count--;
+                continue;
             }
 
-            player->video_queue_read = (player->video_queue_read + 1) % VIDEO_QUEUE_SIZE;
-            player->video_queue_count--;
+            double time_diff = entry->pts - playback_time;
+
+            if (time_diff <= 0.033) {
+                /* Frame is due or late - this is a candidate */
+                if (best_entry != NULL) {
+                    best_entry->valid = false;  /* Drop older ready frame */
+                }
+                best_entry = entry;
+
+                /* Remove from queue and keep looking for newer ready frames */
+                player->video_queue_read = (player->video_queue_read + 1) % VIDEO_QUEUE_SIZE;
+                player->video_queue_count--;
+            } else if (time_diff > max_latency) {
+                /* Frame is too far in future - we're behind, force display newest */
+                if (best_entry != NULL) {
+                    best_entry->valid = false;
+                }
+                best_entry = entry;
+                player->video_queue_read = (player->video_queue_read + 1) % VIDEO_QUEUE_SIZE;
+                player->video_queue_count--;
+                /* Reset playback clock to this frame's time to resync */
+                unlock_queue(player);
+                lock_state(player);
+                player->start_pts = entry->pts;
+                player->playback_start_time = av_gettime();
+                unlock_state(player);
+                lock_queue(player);
+            } else {
+                /* Frame is early but within acceptable latency - wait */
+                break;
+            }
         }
 
-        /* Display the newest frame if we found one */
-        if (newest_entry != NULL) {
-            int frame_size = newest_entry->width * newest_entry->height * 4;
+        /* Display the best frame if we found one */
+        if (best_entry != NULL) {
+            int frame_size = best_entry->width * best_entry->height * 4;
             if (!player->display_buffer) {
                 player->display_buffer = (uint8_t*)av_malloc(frame_size);
             }
 
-            memcpy(player->display_buffer, newest_entry->data, frame_size);
-            player->display_width = newest_entry->width;
-            player->display_height = newest_entry->height;
-            player->display_stride = newest_entry->stride;
-            player->display_pts = newest_entry->pts;
+            memcpy(player->display_buffer, best_entry->data, frame_size);
+            player->display_width = best_entry->width;
+            player->display_height = best_entry->height;
+            player->display_stride = best_entry->stride;
+            player->display_pts = best_entry->pts;
             player->display_ready = true;
-            newest_entry->valid = false;
+            best_entry->valid = false;
 
             frames_ready = 1;
 
-            /* Update current PTS */
             unlock_queue(player);
             lock_state(player);
             player->video_pts = player->display_pts;
