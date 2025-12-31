@@ -461,6 +461,18 @@ namespace Prism.FFmpeg
         // Private Methods
         // ============================================================================
 
+        // Static log callback to prevent garbage collection
+        private static PrismFFmpegBridge.LogCallback _logCallback;
+
+        private static void NativeLogCallback(int level, IntPtr messagePtr)
+        {
+            string message = System.Runtime.InteropServices.Marshal.PtrToStringAnsi(messagePtr);
+            if (!string.IsNullOrEmpty(message))
+            {
+                Debug.Log("[PrismFFmpeg Native] " + message);
+            }
+        }
+
         private void InitializeLibrary()
         {
             if (_initialized)
@@ -468,6 +480,10 @@ namespace Prism.FFmpeg
 
             try
             {
+                // Set up native logging first
+                _logCallback = NativeLogCallback;
+                PrismFFmpegBridge.prism_set_log_callback(_logCallback);
+
                 int result = PrismFFmpegBridge.prism_init();
                 if (result != 0)
                 {

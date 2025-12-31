@@ -1151,9 +1151,8 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
         int64_t elapsed_since_last = now - player->last_frame_display_time;
         /* frame_duration is in seconds, convert to microseconds */
         int64_t frame_interval_us = (int64_t)(player->frame_duration * 1000000.0);
-        /* For live, allow slightly faster to catch up (90% of frame duration) */
-        int64_t min_interval = frame_interval_us * 9 / 10;
-        bool time_for_new_frame = (elapsed_since_last >= min_interval) || !player->first_frame_displayed;
+        /* Use exact frame duration for proper pacing */
+        bool time_for_new_frame = (elapsed_since_last >= frame_interval_us) || !player->first_frame_displayed;
 
         if (!time_for_new_frame) {
             /* Not time yet, don't display */
