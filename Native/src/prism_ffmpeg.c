@@ -118,6 +118,7 @@ struct PrismPlayer {
     int video_height;
     int video_stride;
     bool first_frame_decoded;       /* Track if we've decoded the first frame */
+    bool first_frame_displayed;     /* Track if we've displayed the first frame (for clock sync) */
 
     /* Callbacks */
     PrismVideoFrameCallback video_callback;
@@ -292,6 +293,7 @@ static void* decoder_thread_func(void* arg) {
                     player->start_pts = 0;
                     player->current_pts = 0;
                     player->first_frame_decoded = false;
+                    player->first_frame_displayed = false;
                     unlock_state(player);
                     continue;
                 } else {
@@ -319,13 +321,11 @@ static void* decoder_thread_func(void* arg) {
                         frame_pts = frame->best_effort_timestamp * player->video_time_base;
                     }
 
-                    /* Sync playback clock on first frame */
+                    /* Mark that we have decoded frames (clock sync happens on display) */
                     lock_state(player);
                     if (!player->first_frame_decoded) {
                         player->first_frame_decoded = true;
-                        player->start_pts = frame_pts;
-                        player->playback_start_time = av_gettime();
-                        prism_log(1, "First video frame PTS: %.3f", frame_pts);
+                        prism_log(1, "First video frame decoded, PTS: %.3f", frame_pts);
                     }
                     unlock_state(player);
 
@@ -781,6 +781,7 @@ PRISM_API int prism_player_open_with_options(PrismPlayer* player, const char* ur
     player->state = PRISM_STATE_READY;
     player->last_error = PRISM_OK;
     player->first_frame_decoded = false;
+    player->first_frame_displayed = false;
 
     unlock_state(player);
     prism_log(1, "Media opened successfully");
@@ -858,6 +859,7 @@ PRISM_API void prism_player_close(PrismPlayer* player) {
     player->audio_stream_idx = -1;
     player->state = PRISM_STATE_IDLE;
     player->first_frame_decoded = false;
+    player->first_frame_displayed = false;
 
     unlock_state(player);
 }
@@ -929,6 +931,7 @@ PRISM_API int prism_player_stop(PrismPlayer* player) {
 
     player->current_pts = 0;
     player->first_frame_decoded = false;
+    player->first_frame_displayed = false;
     player->state = PRISM_STATE_STOPPED;
 
     unlock_state(player);
@@ -986,7 +989,8 @@ PRISM_API int prism_player_seek(PrismPlayer* player, double position_seconds) {
     }
 
     player->current_pts = position_seconds;
-    player->first_frame_decoded = false;  /* Re-sync clock on next frame */
+    player->first_frame_decoded = false;
+    player->first_frame_displayed = false;  /* Re-sync clock on next frame */
 
     unlock_state(player);
 
@@ -1167,6 +1171,13 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
 
             unlock_queue(player);
             lock_state(player);
+            /* Sync clock on first frame DISPLAY (not decode) */
+            if (!player->first_frame_displayed) {
+                player->first_frame_displayed = true;
+                player->start_pts = player->display_pts;
+                player->playback_start_time = av_gettime();
+                prism_log(1, "First frame displayed, synced clock to PTS: %.3f", player->display_pts);
+            }
             player->video_pts = player->display_pts;
             player->current_pts = player->display_pts;
             unlock_state(player);
@@ -1185,6 +1196,10 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
         }
     } else {
         /* VOD MODE: Respect timing for smooth playback */
+        lock_state(player);
+        bool need_clock_sync = !player->first_frame_displayed;
+        unlock_state(player);
+
         while (player->video_queue_count > 0) {
             int idx = player->video_queue_read;
             VideoFrameEntry* entry = &player->video_queue[idx];
@@ -1195,9 +1210,12 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
                 continue;
             }
 
+            /* First frame: always display and sync clock */
+            /* Subsequent frames: check timing */
             double time_diff = entry->pts - playback_time;
+            bool should_display = need_clock_sync || (time_diff <= 0.016);
 
-            if (time_diff <= 0.016) {
+            if (should_display) {
                 /* Frame is due - copy to display buffer */
                 int frame_size = entry->width * entry->height * 4;
                 if (!player->display_buffer) {
@@ -1217,6 +1235,13 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
 
                 unlock_queue(player);
                 lock_state(player);
+                /* Sync clock on first frame DISPLAY */
+                if (!player->first_frame_displayed) {
+                    player->first_frame_displayed = true;
+                    player->start_pts = player->display_pts;
+                    player->playback_start_time = av_gettime();
+                    prism_log(1, "VOD: First frame displayed, synced clock to PTS: %.3f", player->display_pts);
+                }
                 player->video_pts = player->display_pts;
                 player->current_pts = player->display_pts;
                 unlock_state(player);
