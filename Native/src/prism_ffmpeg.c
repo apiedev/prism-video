@@ -119,6 +119,7 @@ struct PrismPlayer {
     int video_stride;
     bool first_frame_decoded;       /* Track if we've decoded the first frame */
     bool first_frame_displayed;     /* Track if we've displayed the first frame (for clock sync) */
+    int64_t last_frame_display_time; /* When we last displayed a frame (for pacing) */
 
     /* Callbacks */
     PrismVideoFrameCallback video_callback;
@@ -1126,22 +1127,39 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
     lock_queue(player);
 
     if (is_live) {
-        /* LIVE STREAM MODE: Display ONE frame per update if available.
-         * Don't use PTS timing - let network/decode rate control the pace.
-         * If multiple frames queued (we fell behind), show the newest one.
+        /* LIVE STREAM MODE: Pace display to stream's frame rate.
+         * Only display a new frame if enough time has passed since last display.
+         * If we fall behind (multiple frames queued), skip to newest.
          */
         VideoFrameEntry* frame_to_show = NULL;
 
-        /* If we have more than 1 frame queued, skip to newest (we're behind) */
-        while (player->video_queue_count > 1) {
+        /* Check if enough time has passed to display next frame */
+        lock_state(player);
+        int64_t now = av_gettime();
+        int64_t elapsed_since_last = now - player->last_frame_display_time;
+        /* frame_duration is in seconds, convert to microseconds */
+        int64_t frame_interval_us = (int64_t)(player->frame_duration * 1000000.0);
+        /* For live, allow slightly faster to catch up (90% of frame duration) */
+        int64_t min_interval = frame_interval_us * 9 / 10;
+        bool time_for_new_frame = (elapsed_since_last >= min_interval) || !player->first_frame_displayed;
+        unlock_state(player);
+
+        if (!time_for_new_frame) {
+            /* Not time yet, don't display */
+            unlock_queue(player);
+            return 0;
+        }
+
+        /* If we have more than 2 frames queued, we're behind - skip to newest */
+        while (player->video_queue_count > 2) {
             int idx = player->video_queue_read;
             player->video_queue[idx].valid = false;  /* Drop old frame */
             player->video_queue_read = (player->video_queue_read + 1) % VIDEO_QUEUE_SIZE;
             player->video_queue_count--;
         }
 
-        /* Take the one frame if available */
-        if (player->video_queue_count == 1) {
+        /* Take one frame if available */
+        if (player->video_queue_count > 0) {
             int idx = player->video_queue_read;
             VideoFrameEntry* entry = &player->video_queue[idx];
 
@@ -1176,8 +1194,9 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
                 player->first_frame_displayed = true;
                 player->start_pts = player->display_pts;
                 player->playback_start_time = av_gettime();
-                prism_log(1, "First frame displayed, synced clock to PTS: %.3f", player->display_pts);
+                prism_log(1, "Live: First frame displayed, frame_duration=%.3fms", player->frame_duration * 1000.0);
             }
+            player->last_frame_display_time = av_gettime();
             player->video_pts = player->display_pts;
             player->current_pts = player->display_pts;
             unlock_state(player);
