@@ -398,15 +398,17 @@ PRISM_API int prism_player_open_with_options(PrismPlayer* player, const char* ur
 
             ret = avcodec_open2(player->audio_codec_ctx, codec, NULL);
             if (ret >= 0) {
-                /* Set up audio resampler to output float samples */
+                /* Set up audio resampler to output float samples at 48000 Hz stereo (Unity standard) */
                 player->swr_ctx = swr_alloc();
 
                 AVChannelLayout out_ch_layout = AV_CHANNEL_LAYOUT_STEREO;
                 AVChannelLayout in_ch_layout;
                 av_channel_layout_copy(&in_ch_layout, &player->audio_codec_ctx->ch_layout);
 
+                /* Resample to 48000 Hz stereo float - Unity's default audio rate */
+                const int output_sample_rate = 48000;
                 swr_alloc_set_opts2(&player->swr_ctx,
-                    &out_ch_layout, AV_SAMPLE_FMT_FLT, player->audio_codec_ctx->sample_rate,
+                    &out_ch_layout, AV_SAMPLE_FMT_FLT, output_sample_rate,
                     &in_ch_layout, player->audio_codec_ctx->sample_fmt, player->audio_codec_ctx->sample_rate,
                     0, NULL);
 
@@ -416,13 +418,13 @@ PRISM_API int prism_player_open_with_options(PrismPlayer* player, const char* ur
                 player->audio_time_base = av_q2d(audio_stream->time_base);
 
                 /* Allocate audio ring buffer (2 seconds of stereo audio for smooth playback) */
-                player->audio_buffer_size = player->audio_codec_ctx->sample_rate * 2 * 2;  /* 2 sec stereo */
+                player->audio_buffer_size = output_sample_rate * 2 * 2;  /* 2 sec stereo at 48kHz */
                 player->audio_buffer = (float*)av_malloc(player->audio_buffer_size * sizeof(float));
                 player->audio_write_pos = 0;
                 player->audio_read_pos = 0;
                 player->audio_available = 0;
 
-                prism_log(1, "Audio: %d Hz, %d channels, codec: %s",
+                prism_log(1, "Audio: source %d Hz %d ch, output 48000 Hz stereo, codec: %s",
                     player->audio_codec_ctx->sample_rate,
                     player->audio_codec_ctx->ch_layout.nb_channels,
                     codec->name);
@@ -703,7 +705,7 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
         if (player->has_new_frame && !video_ready) {
             time_diff = player->video_pts - playback_time;
 
-            if (time_diff <= 0.01) {  /* Frame is due or late (within 10ms) */
+            if (time_diff <= 0.016) {  /* Frame is due or late (within ~1 frame at 60fps) */
                 player->frame_ready = true;
                 frames_decoded = 1;
                 video_ready = true;
@@ -715,8 +717,9 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
                     continue;
                 }
                 /* Don't break here - continue to fill audio buffer */
-            } else if (time_diff > 0.1) {
-                /* Frame is too early (>100ms), stop decoding video but continue audio */
+            } else {
+                /* Frame is early - mark video as satisfied, don't decode more
+                 * The frame will be displayed on a future Update() call */
                 video_ready = true;
             }
         }
@@ -917,11 +920,13 @@ PRISM_API int prism_player_get_audio_samples(PrismPlayer* player, float* buffer,
 }
 
 PRISM_API int prism_player_get_audio_sample_rate(PrismPlayer* player) {
-    return (player && player->audio_codec_ctx) ? player->audio_codec_ctx->sample_rate : 0;
+    /* Return output sample rate (48000 Hz), not source sample rate */
+    return (player && player->audio_codec_ctx) ? 48000 : 0;
 }
 
 PRISM_API int prism_player_get_audio_channels(PrismPlayer* player) {
-    return (player && player->audio_codec_ctx) ? player->audio_codec_ctx->ch_layout.nb_channels : 0;
+    /* Return output channels (always stereo after resampling), not source channels */
+    return (player && player->audio_codec_ctx) ? 2 : 0;
 }
 
 /* ============================================================================
