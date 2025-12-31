@@ -642,9 +642,17 @@ PRISM_API int prism_player_open_with_options(PrismPlayer* player, const char* ur
         return PRISM_ERROR_OPEN_FAILED;
     }
 
-    /* Detect if live stream */
-    player->is_live = (player->format_ctx->duration == AV_NOPTS_VALUE);
-    player->duration = player->is_live ? 0.0 : (double)player->format_ctx->duration / AV_TIME_BASE;
+    /* Detect if live stream - check multiple indicators */
+    bool duration_unknown = (player->format_ctx->duration == AV_NOPTS_VALUE);
+    bool is_hls = (strstr(url, ".m3u8") != NULL) || (strstr(url, "m3u8") != NULL);
+    bool is_rtsp = (strstr(url, "rtsp://") != NULL) || (strstr(url, "rtsps://") != NULL);
+    bool is_rtmp = (strstr(url, "rtmp://") != NULL) || (strstr(url, "rtmps://") != NULL);
+    /* Treat HLS, RTSP, RTMP as potentially live, also check duration */
+    player->is_live = duration_unknown || is_hls || is_rtsp || is_rtmp;
+    player->duration = (player->format_ctx->duration != AV_NOPTS_VALUE) ?
+        (double)player->format_ctx->duration / AV_TIME_BASE : 0.0;
+    prism_log(1, "Live detection: duration_unknown=%d, is_hls=%d, is_rtsp=%d, is_rtmp=%d -> is_live=%d",
+        duration_unknown, is_hls, is_rtsp, is_rtmp, player->is_live);
 
     /* Find video stream */
     for (unsigned int i = 0; i < player->format_ctx->nb_streams; i++) {
@@ -703,7 +711,10 @@ PRISM_API int prism_player_open_with_options(PrismPlayer* player, const char* ur
         player->frame_duration = av_q2d(av_inv_q(video_stream->avg_frame_rate));
         if (player->frame_duration <= 0 || player->frame_duration > 1.0) {
             player->frame_duration = 1.0 / 30.0;  /* Default to 30fps */
+            prism_log(1, "Warning: Invalid frame rate, defaulting to 30fps");
         }
+        prism_log(1, "Stream info: is_live=%d, frame_duration=%.3fms (%.1f fps)",
+            player->is_live, player->frame_duration * 1000.0, 1.0 / player->frame_duration);
 
         /* Allocate video conversion context */
         enum AVPixelFormat dst_fmt = AV_PIX_FMT_RGBA;
