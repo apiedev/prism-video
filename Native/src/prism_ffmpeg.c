@@ -253,17 +253,22 @@ static void* decoder_thread_func(void* arg) {
             continue;
         }
 
-        /* Check if video queue is full (only throttle for VOD, not live) */
+        /* Check if we should throttle decoding */
         lock_queue(player);
-        bool queue_full = (player->video_queue_count >= VIDEO_QUEUE_SIZE - 1);
-        bool audio_full = (player->audio_stream_idx < 0) ||
-                          (player->audio_available > player->audio_buffer_size * 3 / 4);
         bool is_live_stream = player->is_live;
+        /* For live streams, keep queue small (2 frames) to minimize latency */
+        int queue_threshold = is_live_stream ? 2 : (VIDEO_QUEUE_SIZE - 1);
+        bool queue_full = (player->video_queue_count >= queue_threshold);
+        /* For live, also keep less audio buffered (250ms vs 1.5s) */
+        int audio_threshold = is_live_stream ?
+            (player->audio_buffer_size / 8) :   /* ~250ms for live */
+            (player->audio_buffer_size * 3 / 4); /* ~1.5s for VOD */
+        bool audio_full = (player->audio_stream_idx < 0) ||
+                          (player->audio_available > audio_threshold);
         unlock_queue(player);
 
-        /* For live streams, never throttle - we drop old data instead */
-        if (!is_live_stream && queue_full && audio_full) {
-            /* Buffers are full, wait a bit */
+        if (queue_full && audio_full) {
+            /* Buffers are full enough, wait a bit */
 #ifdef _WIN32
             Sleep(5);
 #else
@@ -332,15 +337,6 @@ static void* decoder_thread_func(void* arg) {
 
                     /* Add to video queue */
                     lock_queue(player);
-
-                    /* For live streams: if queue is full, drop oldest frame */
-                    if (player->is_live && player->video_queue_count >= VIDEO_QUEUE_SIZE) {
-                        /* Drop oldest frame */
-                        player->video_queue[player->video_queue_read].valid = false;
-                        player->video_queue_read = (player->video_queue_read + 1) % VIDEO_QUEUE_SIZE;
-                        player->video_queue_count--;
-                    }
-
                     if (player->video_queue_count < VIDEO_QUEUE_SIZE) {
                         int idx = player->video_queue_write;
                         VideoFrameEntry* entry = &player->video_queue[idx];
@@ -399,21 +395,7 @@ static void* decoder_thread_func(void* arg) {
                     if (samples_converted > 0) {
                         /* Write to audio ring buffer */
                         lock_queue(player);
-
                         int total_samples = samples_converted * 2;
-
-                        /* For live streams: if buffer would overflow, drop OLD audio to make room */
-                        if (player->is_live) {
-                            int space_needed = total_samples;
-                            int space_available = player->audio_buffer_size - player->audio_available;
-                            if (space_available < space_needed) {
-                                /* Drop old samples to make room */
-                                int to_drop = space_needed - space_available;
-                                player->audio_read_pos = (player->audio_read_pos + to_drop) % player->audio_buffer_size;
-                                player->audio_available -= to_drop;
-                            }
-                        }
-
                         for (int i = 0; i < total_samples; i++) {
                             if (player->audio_available < player->audio_buffer_size) {
                                 player->audio_buffer[player->audio_write_pos] = temp_buffer[i];
@@ -1140,72 +1122,46 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
     lock_queue(player);
 
     if (is_live) {
-        /* LIVE STREAM MODE: Respect timing but skip to newest READY frame
-         * - Still use PTS timing so we don't play faster than stream rate
-         * - When behind, skip to newest frame that's due (drop old frames)
-         * - Cap latency by not buffering too far ahead
+        /* LIVE STREAM MODE: Display ONE frame per update if available.
+         * Don't use PTS timing - let network/decode rate control the pace.
+         * If multiple frames queued (we fell behind), show the newest one.
          */
-        VideoFrameEntry* best_entry = NULL;
-        double max_latency = 0.2;  /* Max 200ms latency for live */
+        VideoFrameEntry* frame_to_show = NULL;
 
-        /* Find the newest frame that's ready to display */
-        while (player->video_queue_count > 0) {
+        /* If we have more than 1 frame queued, skip to newest (we're behind) */
+        while (player->video_queue_count > 1) {
+            int idx = player->video_queue_read;
+            player->video_queue[idx].valid = false;  /* Drop old frame */
+            player->video_queue_read = (player->video_queue_read + 1) % VIDEO_QUEUE_SIZE;
+            player->video_queue_count--;
+        }
+
+        /* Take the one frame if available */
+        if (player->video_queue_count == 1) {
             int idx = player->video_queue_read;
             VideoFrameEntry* entry = &player->video_queue[idx];
 
-            if (!entry->valid) {
+            if (entry->valid) {
+                frame_to_show = entry;
                 player->video_queue_read = (player->video_queue_read + 1) % VIDEO_QUEUE_SIZE;
                 player->video_queue_count--;
-                continue;
-            }
-
-            double time_diff = entry->pts - playback_time;
-
-            if (time_diff <= 0.033) {
-                /* Frame is due or late - this is a candidate */
-                if (best_entry != NULL) {
-                    best_entry->valid = false;  /* Drop older ready frame */
-                }
-                best_entry = entry;
-
-                /* Remove from queue and keep looking for newer ready frames */
-                player->video_queue_read = (player->video_queue_read + 1) % VIDEO_QUEUE_SIZE;
-                player->video_queue_count--;
-            } else if (time_diff > max_latency) {
-                /* Frame is too far in future - we're behind, force display newest */
-                if (best_entry != NULL) {
-                    best_entry->valid = false;
-                }
-                best_entry = entry;
-                player->video_queue_read = (player->video_queue_read + 1) % VIDEO_QUEUE_SIZE;
-                player->video_queue_count--;
-                /* Reset playback clock to this frame's time to resync */
-                unlock_queue(player);
-                lock_state(player);
-                player->start_pts = entry->pts;
-                player->playback_start_time = av_gettime();
-                unlock_state(player);
-                lock_queue(player);
-            } else {
-                /* Frame is early but within acceptable latency - wait */
-                break;
             }
         }
 
-        /* Display the best frame if we found one */
-        if (best_entry != NULL) {
-            int frame_size = best_entry->width * best_entry->height * 4;
+        /* Display the frame if we have one */
+        if (frame_to_show != NULL) {
+            int frame_size = frame_to_show->width * frame_to_show->height * 4;
             if (!player->display_buffer) {
                 player->display_buffer = (uint8_t*)av_malloc(frame_size);
             }
 
-            memcpy(player->display_buffer, best_entry->data, frame_size);
-            player->display_width = best_entry->width;
-            player->display_height = best_entry->height;
-            player->display_stride = best_entry->stride;
-            player->display_pts = best_entry->pts;
+            memcpy(player->display_buffer, frame_to_show->data, frame_size);
+            player->display_width = frame_to_show->width;
+            player->display_height = frame_to_show->height;
+            player->display_stride = frame_to_show->stride;
+            player->display_pts = frame_to_show->pts;
             player->display_ready = true;
-            best_entry->valid = false;
+            frame_to_show->valid = false;
 
             frames_ready = 1;
 
