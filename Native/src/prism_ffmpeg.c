@@ -1145,7 +1145,8 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
         VideoFrameEntry* frame_to_show = NULL;
 
         /* Check if enough time has passed to display next frame */
-        lock_state(player);
+        /* Note: Read timing state while holding queue_lock is safe since we write
+         * these values while also holding queue_lock in the display section below */
         int64_t now = av_gettime();
         int64_t elapsed_since_last = now - player->last_frame_display_time;
         /* frame_duration is in seconds, convert to microseconds */
@@ -1153,7 +1154,6 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
         /* For live, allow slightly faster to catch up (90% of frame duration) */
         int64_t min_interval = frame_interval_us * 9 / 10;
         bool time_for_new_frame = (elapsed_since_last >= min_interval) || !player->first_frame_displayed;
-        unlock_state(player);
 
         if (!time_for_new_frame) {
             /* Not time yet, don't display */
@@ -1198,8 +1198,6 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
 
             frames_ready = 1;
 
-            unlock_queue(player);
-            lock_state(player);
             /* Sync clock on first frame DISPLAY (not decode) */
             if (!player->first_frame_displayed) {
                 player->first_frame_displayed = true;
@@ -1210,8 +1208,6 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
             player->last_frame_display_time = av_gettime();
             player->video_pts = player->display_pts;
             player->current_pts = player->display_pts;
-            unlock_state(player);
-            lock_queue(player);
 
             if (player->video_callback) {
                 player->video_callback(
@@ -1226,9 +1222,7 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
         }
     } else {
         /* VOD MODE: Respect timing for smooth playback */
-        lock_state(player);
         bool need_clock_sync = !player->first_frame_displayed;
-        unlock_state(player);
 
         while (player->video_queue_count > 0) {
             int idx = player->video_queue_read;
@@ -1263,8 +1257,6 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
                 player->video_queue_read = (player->video_queue_read + 1) % VIDEO_QUEUE_SIZE;
                 player->video_queue_count--;
 
-                unlock_queue(player);
-                lock_state(player);
                 /* Sync clock on first frame DISPLAY */
                 if (!player->first_frame_displayed) {
                     player->first_frame_displayed = true;
@@ -1274,8 +1266,6 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
                 }
                 player->video_pts = player->display_pts;
                 player->current_pts = player->display_pts;
-                unlock_state(player);
-                lock_queue(player);
 
                 frames_ready = 1;
 
