@@ -59,9 +59,6 @@ namespace Prism.FFmpeg
         private float[] _audioBuffer;
         private AudioSource _audioSource;
 
-        // Video frame buffer for flipping
-        private byte[] _videoFlipBuffer;
-
         // Audio ring buffer for smooth playback
         private float[] _audioRingBuffer;
         private int _audioRingWritePos;
@@ -333,7 +330,8 @@ namespace Prism.FFmpeg
             {
                 string error = PrismFFmpegBridge.GetErrorMessage(_player);
                 Debug.LogError("[PrismFFmpeg] Failed to open: " + error);
-                OnError.Invoke(error);
+                if (OnError != null)
+                    OnError.Invoke(error);
                 return;
             }
 
@@ -359,7 +357,8 @@ namespace Prism.FFmpeg
             }
 
             _lastState = State;
-            OnPrepared.Invoke();
+            if (OnPrepared != null)
+                OnPrepared.Invoke();
 
             // Auto-play if configured
             if (_playOnAwake)
@@ -555,27 +554,8 @@ namespace Prism.FFmpeg
                 CreateVideoTexture(width, height);
             }
 
-            int frameSize = width * height * 4;
-            int rowBytes = width * 4;
-
-            // Ensure flip buffer is allocated
-            if (_videoFlipBuffer == null || _videoFlipBuffer.Length != frameSize)
-            {
-                _videoFlipBuffer = new byte[frameSize];
-            }
-
-            // Copy frame data with vertical flip (copy rows in reverse order)
-            for (int y = 0; y < height; y++)
-            {
-                int srcRow = y;
-                int dstRow = height - 1 - y;
-                IntPtr srcPtr = frameData + (srcRow * rowBytes);
-                int dstOffset = dstRow * rowBytes;
-                Marshal.Copy(srcPtr, _videoFlipBuffer, dstOffset, rowBytes);
-            }
-
-            // Load flipped data to texture
-            _videoTexture.LoadRawTextureData(_videoFlipBuffer);
+            // Load frame data directly to texture
+            _videoTexture.LoadRawTextureData(frameData, width * height * 4);
             _videoTexture.Apply(false);
 
             // Blit to render texture if set
@@ -693,7 +673,8 @@ namespace Prism.FFmpeg
             {
                 string error = "Resolution failed: " + task.Exception.Message;
                 Debug.LogError("[PrismFFmpeg] " + error);
-                OnError.Invoke(error);
+                if (OnError != null)
+                    OnError.Invoke(error);
                 yield break;
             }
 
@@ -703,7 +684,8 @@ namespace Prism.FFmpeg
             if (!info.Success)
             {
                 Debug.LogError("[PrismFFmpeg] Resolution failed: " + info.Error);
-                OnError.Invoke(info.Error);
+                if (OnError != null)
+                    OnError.Invoke(info.Error);
                 yield break;
             }
 
@@ -721,19 +703,23 @@ namespace Prism.FFmpeg
             switch (newState)
             {
                 case PrismFFmpegBridge.PrismState.Playing:
-                    OnStarted.Invoke();
+                    if (OnStarted != null)
+                        OnStarted.Invoke();
                     break;
 
                 case PrismFFmpegBridge.PrismState.Paused:
-                    OnPaused.Invoke();
+                    if (OnPaused != null)
+                        OnPaused.Invoke();
                     break;
 
                 case PrismFFmpegBridge.PrismState.Stopped:
-                    OnStopped.Invoke();
+                    if (OnStopped != null)
+                        OnStopped.Invoke();
                     break;
 
                 case PrismFFmpegBridge.PrismState.EndOfFile:
-                    OnFinished.Invoke();
+                    if (OnFinished != null)
+                        OnFinished.Invoke();
                     if (_loop)
                     {
                         Seek(0);
@@ -744,7 +730,8 @@ namespace Prism.FFmpeg
                 case PrismFFmpegBridge.PrismState.Error:
                     string error = PrismFFmpegBridge.GetErrorMessage(_player);
                     Debug.LogError("[PrismFFmpeg] Error: " + error);
-                    OnError.Invoke(error);
+                    if (OnError != null)
+                        OnError.Invoke(error);
                     break;
             }
         }

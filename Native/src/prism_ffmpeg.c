@@ -56,22 +56,28 @@ struct PrismPlayer {
     uint8_t* video_buffer;
     int video_buffer_size;
 
-    /* Audio buffer */
+    /* Audio ring buffer for proper queuing */
     float* audio_buffer;
-    int audio_buffer_size;
-    int audio_buffer_samples;
-    int audio_read_pos;
+    int audio_buffer_size;      /* Total buffer size in samples */
+    int audio_write_pos;        /* Write position in ring buffer */
+    int audio_read_pos;         /* Read position in ring buffer */
+    int audio_available;        /* Available samples to read */
 
     /* State */
     PrismState state;
     PrismError last_error;
     char error_message[256];
 
-    /* Playback info */
+    /* Playback clock for A/V sync */
+    int64_t playback_start_time;    /* When playback started (microseconds) */
+    double start_pts;               /* PTS at playback start */
     double current_pts;
     double video_pts;
     double audio_pts;
     double duration;
+    double video_time_base;         /* Video stream time base */
+    double audio_time_base;         /* Audio stream time base */
+    double frame_duration;          /* Expected frame duration in seconds */
     bool is_live;
     bool loop;
     float speed;
@@ -86,6 +92,7 @@ struct PrismPlayer {
     int video_height;
     int video_stride;
     bool has_new_frame;
+    bool frame_ready;               /* Frame is ready to display based on timing */
 
     /* Callbacks */
     PrismVideoFrameCallback video_callback;
@@ -348,6 +355,11 @@ PRISM_API int prism_player_open_with_options(PrismPlayer* player, const char* ur
 
         player->video_width = player->video_codec_ctx->width;
         player->video_height = player->video_codec_ctx->height;
+        player->video_time_base = av_q2d(video_stream->time_base);
+        player->frame_duration = av_q2d(av_inv_q(video_stream->avg_frame_rate));
+        if (player->frame_duration <= 0 || player->frame_duration > 1.0) {
+            player->frame_duration = 1.0 / 30.0;  /* Default to 30fps */
+        }
 
         /* Allocate video conversion context */
         enum AVPixelFormat dst_fmt = AV_PIX_FMT_RGBA;
@@ -400,11 +412,15 @@ PRISM_API int prism_player_open_with_options(PrismPlayer* player, const char* ur
 
                 swr_init(player->swr_ctx);
 
-                /* Allocate audio buffer (1 second of audio) */
-                player->audio_buffer_size = player->audio_codec_ctx->sample_rate * 2 * sizeof(float);
-                player->audio_buffer = (float*)av_malloc(player->audio_buffer_size);
-                player->audio_buffer_samples = 0;
+                /* Set audio time base */
+                player->audio_time_base = av_q2d(audio_stream->time_base);
+
+                /* Allocate audio ring buffer (1 second of stereo audio) */
+                player->audio_buffer_size = player->audio_codec_ctx->sample_rate * 2;  /* 1 sec stereo */
+                player->audio_buffer = (float*)av_malloc(player->audio_buffer_size * sizeof(float));
+                player->audio_write_pos = 0;
                 player->audio_read_pos = 0;
+                player->audio_available = 0;
 
                 prism_log(1, "Audio: %d Hz, %d channels, codec: %s",
                     player->audio_codec_ctx->sample_rate,
@@ -494,6 +510,9 @@ PRISM_API int prism_player_play(PrismPlayer* player) {
         return PRISM_ERROR_NOT_READY;
     }
 
+    /* Initialize playback clock */
+    player->playback_start_time = av_gettime();
+    player->start_pts = player->current_pts;
     player->state = PRISM_STATE_PLAYING;
     unlock_player(player);
 
@@ -645,6 +664,17 @@ PRISM_API bool prism_player_is_live(PrismPlayer* player) {
  * Frame Access
  * ========================================================================== */
 
+/* Helper to write samples to audio ring buffer */
+static void audio_ring_write(PrismPlayer* player, float* samples, int count) {
+    for (int i = 0; i < count; i++) {
+        if (player->audio_available < player->audio_buffer_size) {
+            player->audio_buffer[player->audio_write_pos] = samples[i] * player->volume;
+            player->audio_write_pos = (player->audio_write_pos + 1) % player->audio_buffer_size;
+            player->audio_available++;
+        }
+    }
+}
+
 PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
     if (!player || player->state != PRISM_STATE_PLAYING) {
         return 0;
@@ -655,8 +685,38 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
     int frames_decoded = 0;
     int ret;
 
-    /* Read packets and decode */
-    while (frames_decoded < 1) {  /* Decode one frame per update */
+    /* Calculate current playback position based on wall clock */
+    int64_t elapsed_us = av_gettime() - player->playback_start_time;
+    double playback_time = player->start_pts + (elapsed_us / 1000000.0) * player->speed;
+
+    /* For live streams, be more aggressive - always try to catch up */
+    double time_diff = 0;
+    (void)time_diff;  /* May be unused depending on code path */
+
+    /* Read and decode packets until we have a frame ready for display */
+    int max_iterations = 100;  /* Prevent infinite loops */
+    while (max_iterations-- > 0) {
+        /* Check if current frame is ready for display */
+        if (player->has_new_frame) {
+            time_diff = player->video_pts - playback_time;
+
+            if (time_diff <= 0.01) {  /* Frame is due or late (within 10ms) */
+                player->frame_ready = true;
+                frames_decoded = 1;
+
+                /* If we're significantly behind on a live stream, drop frames */
+                if (player->is_live && time_diff < -0.1) {
+                    player->has_new_frame = false;  /* Force decode next frame */
+                    continue;
+                }
+                break;
+            } else {
+                /* Frame is too early, wait */
+                break;
+            }
+        }
+
+        /* Need to decode more frames */
         ret = av_read_frame(player->format_ctx, player->packet);
 
         if (ret < 0) {
@@ -666,6 +726,8 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
                     av_seek_frame(player->format_ctx, -1, 0, AVSEEK_FLAG_BACKWARD);
                     if (player->video_codec_ctx) avcodec_flush_buffers(player->video_codec_ctx);
                     if (player->audio_codec_ctx) avcodec_flush_buffers(player->audio_codec_ctx);
+                    player->playback_start_time = av_gettime();
+                    player->start_pts = 0;
                     player->current_pts = 0;
                     continue;
                 } else {
@@ -682,21 +744,29 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
             if (ret >= 0) {
                 ret = avcodec_receive_frame(player->video_codec_ctx, player->frame);
                 if (ret >= 0) {
+                    /* Get frame PTS */
+                    double frame_pts = 0;
+                    if (player->frame->pts != AV_NOPTS_VALUE) {
+                        frame_pts = player->frame->pts * player->video_time_base;
+                    } else if (player->frame->best_effort_timestamp != AV_NOPTS_VALUE) {
+                        frame_pts = player->frame->best_effort_timestamp * player->video_time_base;
+                    }
+
+                    /* For non-live: skip frames that are too old */
+                    if (!player->is_live && frame_pts < playback_time - 0.5) {
+                        av_packet_unref(player->packet);
+                        continue;  /* Skip this frame, too old */
+                    }
+
                     /* Convert to RGBA */
                     sws_scale(player->sws_ctx,
                         (const uint8_t* const*)player->frame->data, player->frame->linesize,
                         0, player->video_height,
                         player->rgb_frame->data, player->rgb_frame->linesize);
 
-                    /* Update PTS */
-                    AVStream* stream = player->format_ctx->streams[player->video_stream_idx];
-                    if (player->frame->pts != AV_NOPTS_VALUE) {
-                        player->video_pts = player->frame->pts * av_q2d(stream->time_base);
-                        player->current_pts = player->video_pts;
-                    }
-
+                    player->video_pts = frame_pts;
+                    player->current_pts = frame_pts;
                     player->has_new_frame = true;
-                    frames_decoded++;
 
                     /* Call callback if set */
                     if (player->video_callback) {
@@ -720,33 +790,36 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
                 AVFrame* audio_frame = av_frame_alloc();
                 ret = avcodec_receive_frame(player->audio_codec_ctx, audio_frame);
                 if (ret >= 0 && player->swr_ctx) {
+                    /* Get audio PTS */
+                    if (audio_frame->pts != AV_NOPTS_VALUE) {
+                        player->audio_pts = audio_frame->pts * player->audio_time_base;
+                    }
+
                     /* Convert to float samples */
                     int out_samples = swr_get_out_samples(player->swr_ctx, audio_frame->nb_samples);
-                    uint8_t* out_buffer = (uint8_t*)player->audio_buffer;
+                    float* temp_buffer = (float*)av_malloc(out_samples * 2 * sizeof(float));
+                    uint8_t* out_ptr = (uint8_t*)temp_buffer;
 
                     int samples_converted = swr_convert(player->swr_ctx,
-                        &out_buffer, out_samples,
+                        &out_ptr, out_samples,
                         (const uint8_t**)audio_frame->data, audio_frame->nb_samples);
 
                     if (samples_converted > 0) {
-                        player->audio_buffer_samples = samples_converted * 2;  /* Stereo */
-
-                        /* Apply volume */
-                        for (int i = 0; i < player->audio_buffer_samples; i++) {
-                            player->audio_buffer[i] *= player->volume;
-                        }
+                        /* Write to ring buffer */
+                        audio_ring_write(player, temp_buffer, samples_converted * 2);
 
                         /* Call callback if set */
                         if (player->audio_callback) {
                             player->audio_callback(
                                 player->audio_callback_user_data,
-                                player->audio_buffer,
-                                player->audio_buffer_samples / 2,
+                                temp_buffer,
+                                samples_converted,
                                 2,
                                 player->audio_pts
                             );
                         }
                     }
+                    av_free(temp_buffer);
                 }
                 av_frame_free(&audio_frame);
             }
@@ -808,18 +881,13 @@ PRISM_API int prism_player_get_audio_samples(PrismPlayer* player, float* buffer,
 
     lock_player(player);
 
-    int available = player->audio_buffer_samples - player->audio_read_pos;
-    int to_copy = (available < max_samples) ? available : max_samples;
+    int to_copy = (player->audio_available < max_samples) ? player->audio_available : max_samples;
 
-    if (to_copy > 0) {
-        memcpy(buffer, player->audio_buffer + player->audio_read_pos, to_copy * sizeof(float));
-        player->audio_read_pos += to_copy;
-
-        if (player->audio_read_pos >= player->audio_buffer_samples) {
-            player->audio_read_pos = 0;
-            player->audio_buffer_samples = 0;
-        }
+    for (int i = 0; i < to_copy; i++) {
+        buffer[i] = player->audio_buffer[player->audio_read_pos];
+        player->audio_read_pos = (player->audio_read_pos + 1) % player->audio_buffer_size;
     }
+    player->audio_available -= to_copy;
 
     unlock_player(player);
     return to_copy;
