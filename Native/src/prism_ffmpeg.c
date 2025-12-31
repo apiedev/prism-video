@@ -415,8 +415,8 @@ PRISM_API int prism_player_open_with_options(PrismPlayer* player, const char* ur
                 /* Set audio time base */
                 player->audio_time_base = av_q2d(audio_stream->time_base);
 
-                /* Allocate audio ring buffer (1 second of stereo audio) */
-                player->audio_buffer_size = player->audio_codec_ctx->sample_rate * 2;  /* 1 sec stereo */
+                /* Allocate audio ring buffer (2 seconds of stereo audio for smooth playback) */
+                player->audio_buffer_size = player->audio_codec_ctx->sample_rate * 2 * 2;  /* 2 sec stereo */
                 player->audio_buffer = (float*)av_malloc(player->audio_buffer_size * sizeof(float));
                 player->audio_write_pos = 0;
                 player->audio_read_pos = 0;
@@ -668,7 +668,8 @@ PRISM_API bool prism_player_is_live(PrismPlayer* player) {
 static void audio_ring_write(PrismPlayer* player, float* samples, int count) {
     for (int i = 0; i < count; i++) {
         if (player->audio_available < player->audio_buffer_size) {
-            player->audio_buffer[player->audio_write_pos] = samples[i] * player->volume;
+            /* Don't apply volume here - let Unity handle it for consistency */
+            player->audio_buffer[player->audio_write_pos] = samples[i];
             player->audio_write_pos = (player->audio_write_pos + 1) % player->audio_buffer_size;
             player->audio_available++;
         }
@@ -693,27 +694,40 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
     double time_diff = 0;
     (void)time_diff;  /* May be unused depending on code path */
 
-    /* Read and decode packets until we have a frame ready for display */
+    bool video_ready = false;
+
+    /* Read and decode packets - continue until both video and audio are satisfied */
     int max_iterations = 100;  /* Prevent infinite loops */
     while (max_iterations-- > 0) {
         /* Check if current frame is ready for display */
-        if (player->has_new_frame) {
+        if (player->has_new_frame && !video_ready) {
             time_diff = player->video_pts - playback_time;
 
             if (time_diff <= 0.01) {  /* Frame is due or late (within 10ms) */
                 player->frame_ready = true;
                 frames_decoded = 1;
+                video_ready = true;
 
                 /* If we're significantly behind on a live stream, drop frames */
                 if (player->is_live && time_diff < -0.1) {
                     player->has_new_frame = false;  /* Force decode next frame */
+                    video_ready = false;
                     continue;
                 }
-                break;
-            } else {
-                /* Frame is too early, wait */
-                break;
+                /* Don't break here - continue to fill audio buffer */
+            } else if (time_diff > 0.1) {
+                /* Frame is too early (>100ms), stop decoding video but continue audio */
+                video_ready = true;
             }
+        }
+
+        /* Check if we have enough audio buffered (at least 500ms ahead = 1/4 of 2 sec buffer) */
+        bool audio_satisfied = (player->audio_stream_idx < 0) ||
+                               (player->audio_available > player->audio_buffer_size / 4);
+
+        /* If both video and audio are satisfied, we can stop */
+        if (video_ready && audio_satisfied) {
+            break;
         }
 
         /* Need to decode more frames */
@@ -740,50 +754,53 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
 
         /* Video packet */
         if (player->packet->stream_index == player->video_stream_idx && player->video_codec_ctx) {
-            ret = avcodec_send_packet(player->video_codec_ctx, player->packet);
-            if (ret >= 0) {
-                ret = avcodec_receive_frame(player->video_codec_ctx, player->frame);
+            /* Only decode video if we need it */
+            if (!video_ready || !player->has_new_frame) {
+                ret = avcodec_send_packet(player->video_codec_ctx, player->packet);
                 if (ret >= 0) {
-                    /* Get frame PTS */
-                    double frame_pts = 0;
-                    if (player->frame->pts != AV_NOPTS_VALUE) {
-                        frame_pts = player->frame->pts * player->video_time_base;
-                    } else if (player->frame->best_effort_timestamp != AV_NOPTS_VALUE) {
-                        frame_pts = player->frame->best_effort_timestamp * player->video_time_base;
-                    }
+                    ret = avcodec_receive_frame(player->video_codec_ctx, player->frame);
+                    if (ret >= 0) {
+                        /* Get frame PTS */
+                        double frame_pts = 0;
+                        if (player->frame->pts != AV_NOPTS_VALUE) {
+                            frame_pts = player->frame->pts * player->video_time_base;
+                        } else if (player->frame->best_effort_timestamp != AV_NOPTS_VALUE) {
+                            frame_pts = player->frame->best_effort_timestamp * player->video_time_base;
+                        }
 
-                    /* For non-live: skip frames that are too old */
-                    if (!player->is_live && frame_pts < playback_time - 0.5) {
-                        av_packet_unref(player->packet);
-                        continue;  /* Skip this frame, too old */
-                    }
+                        /* For non-live: skip frames that are too old */
+                        if (!player->is_live && frame_pts < playback_time - 0.5) {
+                            av_packet_unref(player->packet);
+                            continue;  /* Skip this frame, too old */
+                        }
 
-                    /* Convert to RGBA */
-                    sws_scale(player->sws_ctx,
-                        (const uint8_t* const*)player->frame->data, player->frame->linesize,
-                        0, player->video_height,
-                        player->rgb_frame->data, player->rgb_frame->linesize);
+                        /* Convert to RGBA */
+                        sws_scale(player->sws_ctx,
+                            (const uint8_t* const*)player->frame->data, player->frame->linesize,
+                            0, player->video_height,
+                            player->rgb_frame->data, player->rgb_frame->linesize);
 
-                    player->video_pts = frame_pts;
-                    player->current_pts = frame_pts;
-                    player->has_new_frame = true;
+                        player->video_pts = frame_pts;
+                        player->current_pts = frame_pts;
+                        player->has_new_frame = true;
 
-                    /* Call callback if set */
-                    if (player->video_callback) {
-                        player->video_callback(
-                            player->video_callback_user_data,
-                            player->video_buffer,
-                            player->video_width,
-                            player->video_height,
-                            player->video_stride,
-                            player->video_pts
-                        );
+                        /* Call callback if set */
+                        if (player->video_callback) {
+                            player->video_callback(
+                                player->video_callback_user_data,
+                                player->video_buffer,
+                                player->video_width,
+                                player->video_height,
+                                player->video_stride,
+                                player->video_pts
+                            );
+                        }
                     }
                 }
             }
         }
 
-        /* Audio packet */
+        /* Audio packet - always decode to keep buffer full */
         if (player->packet->stream_index == player->audio_stream_idx && player->audio_codec_ctx) {
             ret = avcodec_send_packet(player->audio_codec_ctx, player->packet);
             if (ret >= 0) {
