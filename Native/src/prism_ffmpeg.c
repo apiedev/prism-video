@@ -253,15 +253,16 @@ static void* decoder_thread_func(void* arg) {
             continue;
         }
 
-        /* Check if video queue is full */
+        /* Check if video queue is full (only throttle for VOD, not live) */
         lock_queue(player);
         bool queue_full = (player->video_queue_count >= VIDEO_QUEUE_SIZE - 1);
-        /* Also check audio buffer */
         bool audio_full = (player->audio_stream_idx < 0) ||
                           (player->audio_available > player->audio_buffer_size * 3 / 4);
+        bool is_live_stream = player->is_live;
         unlock_queue(player);
 
-        if (queue_full && audio_full) {
+        /* For live streams, never throttle - we drop old data instead */
+        if (!is_live_stream && queue_full && audio_full) {
             /* Buffers are full, wait a bit */
 #ifdef _WIN32
             Sleep(5);
@@ -331,6 +332,15 @@ static void* decoder_thread_func(void* arg) {
 
                     /* Add to video queue */
                     lock_queue(player);
+
+                    /* For live streams: if queue is full, drop oldest frame */
+                    if (player->is_live && player->video_queue_count >= VIDEO_QUEUE_SIZE) {
+                        /* Drop oldest frame */
+                        player->video_queue[player->video_queue_read].valid = false;
+                        player->video_queue_read = (player->video_queue_read + 1) % VIDEO_QUEUE_SIZE;
+                        player->video_queue_count--;
+                    }
+
                     if (player->video_queue_count < VIDEO_QUEUE_SIZE) {
                         int idx = player->video_queue_write;
                         VideoFrameEntry* entry = &player->video_queue[idx];
@@ -389,7 +399,22 @@ static void* decoder_thread_func(void* arg) {
                     if (samples_converted > 0) {
                         /* Write to audio ring buffer */
                         lock_queue(player);
-                        for (int i = 0; i < samples_converted * 2; i++) {
+
+                        int total_samples = samples_converted * 2;
+
+                        /* For live streams: if buffer would overflow, drop OLD audio to make room */
+                        if (player->is_live) {
+                            int space_needed = total_samples;
+                            int space_available = player->audio_buffer_size - player->audio_available;
+                            if (space_available < space_needed) {
+                                /* Drop old samples to make room */
+                                int to_drop = space_needed - space_available;
+                                player->audio_read_pos = (player->audio_read_pos + to_drop) % player->audio_buffer_size;
+                                player->audio_available -= to_drop;
+                            }
+                        }
+
+                        for (int i = 0; i < total_samples; i++) {
                             if (player->audio_available < player->audio_buffer_size) {
                                 player->audio_buffer[player->audio_write_pos] = temp_buffer[i];
                                 player->audio_write_pos = (player->audio_write_pos + 1) % player->audio_buffer_size;
@@ -1114,45 +1139,47 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
     /* Pull frames from video queue based on timing - this is non-blocking */
     lock_queue(player);
 
-    while (player->video_queue_count > 0) {
-        int idx = player->video_queue_read;
-        VideoFrameEntry* entry = &player->video_queue[idx];
+    if (is_live) {
+        /* LIVE STREAM MODE: Always show the newest frame, drop everything else */
+        VideoFrameEntry* newest_entry = NULL;
+        int newest_idx = -1;
 
-        if (!entry->valid) {
-            /* Skip invalid entries */
+        /* Find the newest valid frame and discard all others */
+        while (player->video_queue_count > 0) {
+            int idx = player->video_queue_read;
+            VideoFrameEntry* entry = &player->video_queue[idx];
+
+            if (entry->valid) {
+                /* If we had a previous newest, discard it */
+                if (newest_entry != NULL) {
+                    newest_entry->valid = false;
+                }
+                newest_entry = entry;
+                newest_idx = idx;
+            }
+
             player->video_queue_read = (player->video_queue_read + 1) % VIDEO_QUEUE_SIZE;
             player->video_queue_count--;
-            continue;
         }
 
-        double time_diff = entry->pts - playback_time;
-
-        /* For live streams, be more aggressive about displaying frames */
-        double display_threshold = is_live ? 0.05 : 0.016;
-
-        if (time_diff <= display_threshold) {
-            /* Frame is due or slightly late - copy to display buffer */
-
-            /* Allocate display buffer if needed */
-            int frame_size = entry->width * entry->height * 4;
+        /* Display the newest frame if we found one */
+        if (newest_entry != NULL) {
+            int frame_size = newest_entry->width * newest_entry->height * 4;
             if (!player->display_buffer) {
                 player->display_buffer = (uint8_t*)av_malloc(frame_size);
             }
 
-            /* Copy frame data */
-            memcpy(player->display_buffer, entry->data, frame_size);
-            player->display_width = entry->width;
-            player->display_height = entry->height;
-            player->display_stride = entry->stride;
-            player->display_pts = entry->pts;
+            memcpy(player->display_buffer, newest_entry->data, frame_size);
+            player->display_width = newest_entry->width;
+            player->display_height = newest_entry->height;
+            player->display_stride = newest_entry->stride;
+            player->display_pts = newest_entry->pts;
             player->display_ready = true;
+            newest_entry->valid = false;
 
-            /* Mark entry as consumed */
-            entry->valid = false;
-            player->video_queue_read = (player->video_queue_read + 1) % VIDEO_QUEUE_SIZE;
-            player->video_queue_count--;
+            frames_ready = 1;
 
-            /* Update current PTS (need state lock) */
+            /* Update current PTS */
             unlock_queue(player);
             lock_state(player);
             player->video_pts = player->display_pts;
@@ -1160,14 +1187,6 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
             unlock_state(player);
             lock_queue(player);
 
-            frames_ready = 1;
-
-            /* If significantly behind on live stream, keep dropping */
-            if (is_live && time_diff < -0.1) {
-                continue;  /* Drop more frames to catch up */
-            }
-
-            /* Call video callback if set */
             if (player->video_callback) {
                 player->video_callback(
                     player->video_callback_user_data,
@@ -1178,11 +1197,64 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
                     player->display_pts
                 );
             }
+        }
+    } else {
+        /* VOD MODE: Respect timing for smooth playback */
+        while (player->video_queue_count > 0) {
+            int idx = player->video_queue_read;
+            VideoFrameEntry* entry = &player->video_queue[idx];
 
-            break;  /* One frame per update is enough */
-        } else {
-            /* Frame is early - wait for next update */
-            break;
+            if (!entry->valid) {
+                player->video_queue_read = (player->video_queue_read + 1) % VIDEO_QUEUE_SIZE;
+                player->video_queue_count--;
+                continue;
+            }
+
+            double time_diff = entry->pts - playback_time;
+
+            if (time_diff <= 0.016) {
+                /* Frame is due - copy to display buffer */
+                int frame_size = entry->width * entry->height * 4;
+                if (!player->display_buffer) {
+                    player->display_buffer = (uint8_t*)av_malloc(frame_size);
+                }
+
+                memcpy(player->display_buffer, entry->data, frame_size);
+                player->display_width = entry->width;
+                player->display_height = entry->height;
+                player->display_stride = entry->stride;
+                player->display_pts = entry->pts;
+                player->display_ready = true;
+
+                entry->valid = false;
+                player->video_queue_read = (player->video_queue_read + 1) % VIDEO_QUEUE_SIZE;
+                player->video_queue_count--;
+
+                unlock_queue(player);
+                lock_state(player);
+                player->video_pts = player->display_pts;
+                player->current_pts = player->display_pts;
+                unlock_state(player);
+                lock_queue(player);
+
+                frames_ready = 1;
+
+                if (player->video_callback) {
+                    player->video_callback(
+                        player->video_callback_user_data,
+                        player->display_buffer,
+                        player->display_width,
+                        player->display_height,
+                        player->display_stride,
+                        player->display_pts
+                    );
+                }
+
+                break;
+            } else {
+                /* Frame is early - wait */
+                break;
+            }
         }
     }
 
