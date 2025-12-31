@@ -93,6 +93,7 @@ struct PrismPlayer {
     int video_stride;
     bool has_new_frame;
     bool frame_ready;               /* Frame is ready to display based on timing */
+    bool first_frame_decoded;       /* Track if we've decoded the first frame */
 
     /* Callbacks */
     PrismVideoFrameCallback video_callback;
@@ -437,6 +438,7 @@ PRISM_API int prism_player_open_with_options(PrismPlayer* player, const char* ur
 
     player->state = PRISM_STATE_READY;
     player->last_error = PRISM_OK;
+    player->first_frame_decoded = false;
 
     unlock_player(player);
     prism_log(1, "Media opened successfully");
@@ -588,6 +590,9 @@ PRISM_API int prism_player_seek(PrismPlayer* player, double position_seconds) {
     }
 
     player->current_pts = position_seconds;
+    player->first_frame_decoded = false;  /* Re-sync clock on next frame */
+    player->has_new_frame = false;
+    player->frame_ready = false;
 
     unlock_player(player);
     return PRISM_OK;
@@ -746,6 +751,9 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
                     player->playback_start_time = av_gettime();
                     player->start_pts = 0;
                     player->current_pts = 0;
+                    player->first_frame_decoded = false;  /* Re-sync on loop */
+                    player->has_new_frame = false;
+                    player->frame_ready = false;
                     continue;
                 } else {
                     player->state = PRISM_STATE_END_OF_FILE;
@@ -769,6 +777,15 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
                             frame_pts = player->frame->pts * player->video_time_base;
                         } else if (player->frame->best_effort_timestamp != AV_NOPTS_VALUE) {
                             frame_pts = player->frame->best_effort_timestamp * player->video_time_base;
+                        }
+
+                        /* Sync playback clock on first frame to handle non-zero start PTS */
+                        if (!player->first_frame_decoded) {
+                            player->first_frame_decoded = true;
+                            player->start_pts = frame_pts;
+                            player->playback_start_time = av_gettime();
+                            playback_time = frame_pts;  /* Update local var too */
+                            prism_log(1, "First video frame PTS: %.3f", frame_pts);
                         }
 
                         /* For non-live: skip frames that are too old */
