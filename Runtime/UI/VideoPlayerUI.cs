@@ -3,6 +3,7 @@ using UnityEngine;
 using UnityEngine.UI;
 using UnityEngine.Events;
 using UnityEngine.EventSystems;
+using UnityEngine.Video;
 using TMPro;
 using Prism.FFmpeg;
 
@@ -127,20 +128,24 @@ namespace Prism.UI
         {
             get
             {
-                if (_prismPlayer != null)
-                    return _prismPlayer.Volume;
+                // PrismPlayer exposes volume via VideoPlayer
+                if (_prismPlayer != null && _prismPlayer.VideoPlayer != null)
+                    return _prismPlayer.VideoPlayer.GetDirectAudioVolume(0);
                 if (_ffmpegPlayer != null)
                     return _ffmpegPlayer.Volume;
-                return 1f;
+                return _cachedVolume;
             }
             set
             {
+                _cachedVolume = value;
                 if (_prismPlayer != null)
-                    _prismPlayer.Volume = value;
+                    _prismPlayer.SetVolume(value);
                 if (_ffmpegPlayer != null)
                     _ffmpegPlayer.Volume = value;
             }
         }
+
+        private float _cachedVolume = 1f;
 
         // ============================================================================
         // Unity Lifecycle
@@ -229,15 +234,17 @@ namespace Prism.UI
 
         private void SubscribeToEvents()
         {
+            // PrismPlayer uses C# events (Action)
             if (_prismPlayer != null)
             {
-                _prismPlayer.OnPrepared.AddListener(OnPlayerPrepared);
-                _prismPlayer.OnStarted.AddListener(OnPlayerStarted);
-                _prismPlayer.OnPaused.AddListener(OnPlayerPaused);
-                _prismPlayer.OnStopped.AddListener(OnPlayerStopped);
-                _prismPlayer.OnError.AddListener(OnPlayerError);
+                _prismPlayer.OnPrepared += OnPlayerPrepared;
+                _prismPlayer.OnStarted += OnPlayerStarted;
+                _prismPlayer.OnPaused += OnPlayerPaused;
+                _prismPlayer.OnStopped += OnPlayerStopped;
+                _prismPlayer.OnError += OnPlayerErrorFromPrism;
             }
 
+            // PrismFFmpegPlayer uses UnityEvents
             if (_ffmpegPlayer != null)
             {
                 _ffmpegPlayer.OnPrepared.AddListener(OnPlayerPrepared);
@@ -250,15 +257,17 @@ namespace Prism.UI
 
         private void UnsubscribeFromEvents()
         {
+            // PrismPlayer uses C# events (Action)
             if (_prismPlayer != null)
             {
-                _prismPlayer.OnPrepared.RemoveListener(OnPlayerPrepared);
-                _prismPlayer.OnStarted.RemoveListener(OnPlayerStarted);
-                _prismPlayer.OnPaused.RemoveListener(OnPlayerPaused);
-                _prismPlayer.OnStopped.RemoveListener(OnPlayerStopped);
-                _prismPlayer.OnError.RemoveListener(OnPlayerError);
+                _prismPlayer.OnPrepared -= OnPlayerPrepared;
+                _prismPlayer.OnStarted -= OnPlayerStarted;
+                _prismPlayer.OnPaused -= OnPlayerPaused;
+                _prismPlayer.OnStopped -= OnPlayerStopped;
+                _prismPlayer.OnError -= OnPlayerErrorFromPrism;
             }
 
+            // PrismFFmpegPlayer uses UnityEvents
             if (_ffmpegPlayer != null)
             {
                 _ffmpegPlayer.OnPrepared.RemoveListener(OnPlayerPrepared);
@@ -516,6 +525,12 @@ namespace Prism.UI
             Debug.LogWarning("[VideoPlayerUI] Player error: " + error);
         }
 
+        // Wrapper for PrismPlayer's Action<string> error event
+        private void OnPlayerErrorFromPrism(string error)
+        {
+            OnPlayerError(error);
+        }
+
         // ============================================================================
         // Public Control Methods
         // ============================================================================
@@ -585,15 +600,13 @@ namespace Prism.UI
 
             if (_prismPlayer != null)
             {
-                _prismPlayer.Url = url;
+                _prismPlayer.SetSource(url);
                 _prismPlayer.Play();
             }
 
             if (_ffmpegPlayer != null)
             {
-                _ffmpegPlayer.Url = url;
                 _ffmpegPlayer.Open(url);
-                _ffmpegPlayer.Play();
             }
 
             OnUrlSubmitted?.Invoke(url);
