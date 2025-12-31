@@ -225,6 +225,9 @@ namespace Prism.FFmpeg
         public static extern int prism_player_get_audio_sample_rate(IntPtr player);
 
         [DllImport(LIBRARY_NAME, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void prism_player_set_audio_sample_rate(IntPtr player, int sampleRate);
+
+        [DllImport(LIBRARY_NAME, CallingConvention = CallingConvention.Cdecl)]
         public static extern int prism_player_get_audio_channels(IntPtr player);
 
         // ============================================================================

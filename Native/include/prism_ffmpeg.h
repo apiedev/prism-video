@@ -209,8 +209,11 @@ PRISM_API int prism_player_copy_video_frame(PrismPlayer* player, uint8_t* dest_b
  * Copies up to max_samples to the buffer */
 PRISM_API int prism_player_get_audio_samples(PrismPlayer* player, float* buffer, int max_samples);
 
-/* Get audio sample rate */
+/* Get audio sample rate (output rate, not source) */
 PRISM_API int prism_player_get_audio_sample_rate(PrismPlayer* player);
+
+/* Set audio output sample rate (call before Open, should match Unity's AudioSettings.outputSampleRate) */
+PRISM_API void prism_player_set_audio_sample_rate(PrismPlayer* player, int sample_rate);
 
 /* Get number of audio channels */
 PRISM_API int prism_player_get_audio_channels(PrismPlayer* player);

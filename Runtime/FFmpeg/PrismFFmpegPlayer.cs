@@ -35,6 +35,9 @@ namespace Prism.FFmpeg
 
         [Header("Settings")]
         [SerializeField] private bool _useHardwareAcceleration = true;
+        [SerializeField] private bool _autoReconnect = true;
+        [SerializeField] private float _reconnectDelay = 3f;
+        [SerializeField] private int _maxReconnectAttempts = -1;  // -1 = infinite
 
         [Header("Events")]
         public UnityEvent OnPrepared;
@@ -67,6 +70,12 @@ namespace Prism.FFmpeg
         private int _audioMaxLatencySamples; // Max samples before we drop to catch up
         private readonly object _audioLock = new object();
         private bool _audioStarted;
+
+        // Auto-reconnect state
+        private Coroutine _reconnectCoroutine;
+        private int _reconnectAttempts;
+        private bool _wasPlaying;
+        private bool _manualStop;
 
         // ============================================================================
         // Properties
@@ -220,6 +229,23 @@ namespace Prism.FFmpeg
             }
         }
 
+        public bool AutoReconnect
+        {
+            get { return _autoReconnect; }
+            set { _autoReconnect = value; }
+        }
+
+        public float ReconnectDelay
+        {
+            get { return _reconnectDelay; }
+            set { _reconnectDelay = Mathf.Max(0.5f, value); }
+        }
+
+        public bool IsReconnecting
+        {
+            get { return _reconnectCoroutine != null; }
+        }
+
         // ============================================================================
         // Unity Lifecycle
         // ============================================================================
@@ -369,6 +395,9 @@ namespace Prism.FFmpeg
 
         public void Play()
         {
+            _manualStop = false;
+            StopReconnectCoroutine();
+
             if (_player == IntPtr.Zero)
             {
                 if (!string.IsNullOrEmpty(_url))
@@ -395,6 +424,9 @@ namespace Prism.FFmpeg
 
         public void Stop()
         {
+            _manualStop = true;
+            StopReconnectCoroutine();
+
             if (_player == IntPtr.Zero)
                 return;
 
@@ -420,6 +452,9 @@ namespace Prism.FFmpeg
 
         public void Close()
         {
+            _manualStop = true;
+            StopReconnectCoroutine();
+
             // Stop audio first
             if (_audioSource != null && _audioSource.isPlaying)
             {
@@ -520,7 +555,14 @@ namespace Prism.FFmpeg
             if (_player == IntPtr.Zero)
             {
                 Debug.LogError("[PrismFFmpeg] Failed to create player");
+                return;
             }
+
+            // Set audio output sample rate to match Unity's audio system
+            // This is critical for correct playback speed
+            int unitySampleRate = AudioSettings.outputSampleRate;
+            PrismFFmpegBridge.prism_player_set_audio_sample_rate(_player, unitySampleRate);
+            Debug.Log("[PrismFFmpeg] Set audio sample rate to Unity's " + unitySampleRate + " Hz");
         }
 
         private void CreateVideoTexture(int width, int height)
@@ -735,6 +777,8 @@ namespace Prism.FFmpeg
             switch (newState)
             {
                 case PrismFFmpegBridge.PrismState.Playing:
+                    _wasPlaying = true;
+                    _reconnectAttempts = 0;  // Reset on successful playback
                     if (OnStarted != null)
                         OnStarted.Invoke();
                     break;
@@ -757,6 +801,11 @@ namespace Prism.FFmpeg
                         Seek(0);
                         Play();
                     }
+                    else if (_autoReconnect && IsLiveStream && !_manualStop)
+                    {
+                        // For live streams, EOF might mean stream ended - try to reconnect
+                        StartReconnect();
+                    }
                     break;
 
                 case PrismFFmpegBridge.PrismState.Error:
@@ -764,7 +813,85 @@ namespace Prism.FFmpeg
                     Debug.LogError("[PrismFFmpeg] Error: " + error);
                     if (OnError != null)
                         OnError.Invoke(error);
+
+                    // Auto-reconnect on error if enabled and not manually stopped
+                    if (_autoReconnect && !_manualStop && !string.IsNullOrEmpty(_resolvedUrl))
+                    {
+                        StartReconnect();
+                    }
                     break;
+            }
+        }
+
+        private void StartReconnect()
+        {
+            if (_reconnectCoroutine != null)
+                return;  // Already reconnecting
+
+            if (_maxReconnectAttempts >= 0 && _reconnectAttempts >= _maxReconnectAttempts)
+            {
+                Debug.LogWarning("[PrismFFmpeg] Max reconnect attempts reached (" + _maxReconnectAttempts + ")");
+                return;
+            }
+
+            _reconnectCoroutine = StartCoroutine(ReconnectCoroutine());
+        }
+
+        private void StopReconnectCoroutine()
+        {
+            if (_reconnectCoroutine != null)
+            {
+                StopCoroutine(_reconnectCoroutine);
+                _reconnectCoroutine = null;
+            }
+        }
+
+        private System.Collections.IEnumerator ReconnectCoroutine()
+        {
+            _reconnectAttempts++;
+            Debug.Log("[PrismFFmpeg] Reconnect attempt " + _reconnectAttempts +
+                (_maxReconnectAttempts >= 0 ? "/" + _maxReconnectAttempts : "") +
+                " in " + _reconnectDelay + "s...");
+
+            yield return new WaitForSeconds(_reconnectDelay);
+
+            // Check if we should still reconnect
+            if (_manualStop || string.IsNullOrEmpty(_resolvedUrl))
+            {
+                _reconnectCoroutine = null;
+                yield break;
+            }
+
+            // Close current player
+            if (_player != IntPtr.Zero)
+            {
+                if (_audioSource != null && _audioSource.isPlaying)
+                    _audioSource.Stop();
+                _audioStarted = false;
+
+                PrismFFmpegBridge.prism_player_close(_player);
+                PrismFFmpegBridge.prism_player_destroy(_player);
+                _player = IntPtr.Zero;
+            }
+
+            // Clear ring buffer
+            lock (_audioLock)
+            {
+                _audioRingBuffer = null;
+                _audioRingWritePos = 0;
+                _audioRingReadPos = 0;
+            }
+
+            _reconnectCoroutine = null;
+
+            // Try to reopen
+            Debug.Log("[PrismFFmpeg] Attempting to reconnect to: " + _resolvedUrl);
+            OpenDirect(_resolvedUrl);
+
+            // Auto-play if we were playing before
+            if (_wasPlaying && State == PrismFFmpegBridge.PrismState.Ready)
+            {
+                Play();
             }
         }
 

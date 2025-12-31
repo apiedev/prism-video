@@ -112,6 +112,7 @@ struct PrismPlayer {
     /* Output settings */
     PrismPixelFormat output_format;
     bool use_hw_accel;
+    int output_sample_rate;  /* Audio output sample rate (default 48000, should match Unity) */
 
     /* Frame info */
     int video_width;
@@ -526,6 +527,7 @@ PRISM_API PrismPlayer* prism_player_create(void) {
     player->volume = 1.0f;
     player->use_hw_accel = false;
     player->decoder_running = false;
+    player->output_sample_rate = 48000;  /* Default, should be set from Unity before Open() */
 
     /* Initialize locks */
 #ifdef _WIN32
@@ -760,10 +762,11 @@ PRISM_API int prism_player_open_with_options(PrismPlayer* player, const char* ur
                 AVChannelLayout in_ch_layout;
                 av_channel_layout_copy(&in_ch_layout, &player->audio_codec_ctx->ch_layout);
 
-                /* Resample to 48000 Hz stereo float - Unity's default audio rate */
-                const int output_sample_rate = 48000;
+                /* Resample to Unity's audio output sample rate (stereo float) */
+                int out_rate = player->output_sample_rate;
+                if (out_rate <= 0) out_rate = 48000;  /* Fallback */
                 swr_alloc_set_opts2(&player->swr_ctx,
-                    &out_ch_layout, AV_SAMPLE_FMT_FLT, output_sample_rate,
+                    &out_ch_layout, AV_SAMPLE_FMT_FLT, out_rate,
                     &in_ch_layout, player->audio_codec_ctx->sample_fmt, player->audio_codec_ctx->sample_rate,
                     0, NULL);
 
@@ -773,15 +776,16 @@ PRISM_API int prism_player_open_with_options(PrismPlayer* player, const char* ur
                 player->audio_time_base = av_q2d(audio_stream->time_base);
 
                 /* Allocate audio ring buffer (2 seconds of stereo audio for smooth playback) */
-                player->audio_buffer_size = output_sample_rate * 2 * 2;  /* 2 sec stereo at 48kHz */
+                player->audio_buffer_size = out_rate * 2 * 2;  /* 2 sec stereo */
                 player->audio_buffer = (float*)av_malloc(player->audio_buffer_size * sizeof(float));
                 player->audio_write_pos = 0;
                 player->audio_read_pos = 0;
                 player->audio_available = 0;
 
-                prism_log(1, "Audio: source %d Hz %d ch, output 48000 Hz stereo, codec: %s",
+                prism_log(1, "Audio: source %d Hz %d ch, output %d Hz stereo, codec: %s",
                     player->audio_codec_ctx->sample_rate,
                     player->audio_codec_ctx->ch_layout.nb_channels,
+                    out_rate,
                     codec->name);
             }
         }
@@ -1139,25 +1143,81 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
 
     if (is_live) {
         /* LIVE STREAM MODE: Pace display to stream's frame rate.
-         * Only display a new frame if enough time has passed since last display.
+         * Use a target-based timing system to prevent drift.
          * If we fall behind (multiple frames queued), skip to newest.
          */
         VideoFrameEntry* frame_to_show = NULL;
 
-        /* Check if enough time has passed to display next frame */
-        /* Note: Read timing state while holding queue_lock is safe since we write
-         * these values while also holding queue_lock in the display section below */
         int64_t now = av_gettime();
-        int64_t elapsed_since_last = now - player->last_frame_display_time;
         /* frame_duration is in seconds, convert to microseconds */
         int64_t frame_interval_us = (int64_t)(player->frame_duration * 1000000.0);
-        /* Use exact frame duration for proper pacing */
-        bool time_for_new_frame = (elapsed_since_last >= frame_interval_us) || !player->first_frame_displayed;
 
-        if (!time_for_new_frame) {
-            /* Not time yet, don't display */
+        /* First frame: initialize timing and display immediately */
+        if (!player->first_frame_displayed) {
+            if (player->video_queue_count > 0) {
+                int idx = player->video_queue_read;
+                VideoFrameEntry* entry = &player->video_queue[idx];
+                if (entry->valid) {
+                    frame_to_show = entry;
+                    player->video_queue_read = (player->video_queue_read + 1) % VIDEO_QUEUE_SIZE;
+                    player->video_queue_count--;
+                }
+            }
+
+            if (frame_to_show != NULL) {
+                int frame_size = frame_to_show->width * frame_to_show->height * 4;
+                if (!player->display_buffer) {
+                    player->display_buffer = (uint8_t*)av_malloc(frame_size);
+                }
+
+                memcpy(player->display_buffer, frame_to_show->data, frame_size);
+                player->display_width = frame_to_show->width;
+                player->display_height = frame_to_show->height;
+                player->display_stride = frame_to_show->stride;
+                player->display_pts = frame_to_show->pts;
+                player->display_ready = true;
+                frame_to_show->valid = false;
+
+                player->first_frame_displayed = true;
+                player->start_pts = player->display_pts;
+                player->playback_start_time = now;
+                /* Set next frame target time */
+                player->last_frame_display_time = now;
+                player->video_pts = player->display_pts;
+                player->current_pts = player->display_pts;
+                frames_ready = 1;
+
+                prism_log(1, "Live: First frame displayed, frame_duration=%.3fms", player->frame_duration * 1000.0);
+
+                if (player->video_callback) {
+                    player->video_callback(
+                        player->video_callback_user_data,
+                        player->display_buffer,
+                        player->display_width,
+                        player->display_height,
+                        player->display_stride,
+                        player->display_pts
+                    );
+                }
+            }
+            unlock_queue(player);
+            return frames_ready;
+        }
+
+        /* Subsequent frames: check if target time has been reached */
+        int64_t next_frame_time = player->last_frame_display_time + frame_interval_us;
+        if (now < next_frame_time) {
+            /* Not time yet */
             unlock_queue(player);
             return 0;
+        }
+
+        /* Time for next frame. If we're significantly behind, catch up timing. */
+        int64_t lateness = now - next_frame_time;
+        if (lateness > frame_interval_us * 3) {
+            /* More than 3 frames behind - reset timing to avoid burst playback */
+            player->last_frame_display_time = now - frame_interval_us;
+            prism_log(1, "Live: Reset timing, was %.1fms behind", lateness / 1000.0);
         }
 
         /* If we have more than 2 frames queued, we're behind - skip to newest */
@@ -1197,14 +1257,8 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
 
             frames_ready = 1;
 
-            /* Sync clock on first frame DISPLAY (not decode) */
-            if (!player->first_frame_displayed) {
-                player->first_frame_displayed = true;
-                player->start_pts = player->display_pts;
-                player->playback_start_time = av_gettime();
-                prism_log(1, "Live: First frame displayed, frame_duration=%.3fms", player->frame_duration * 1000.0);
-            }
-            player->last_frame_display_time = av_gettime();
+            /* Advance to next frame target (prevents timing drift) */
+            player->last_frame_display_time += frame_interval_us;
             player->video_pts = player->display_pts;
             player->current_pts = player->display_pts;
 
@@ -1218,6 +1272,10 @@ PRISM_API int prism_player_update(PrismPlayer* player, double delta_time) {
                     player->display_pts
                 );
             }
+        } else {
+            /* No frame available but we needed one - advance timing anyway
+             * to maintain cadence when frames do arrive */
+            player->last_frame_display_time += frame_interval_us;
         }
     } else {
         /* VOD MODE: Respect timing for smooth playback */
@@ -1371,8 +1429,16 @@ PRISM_API int prism_player_get_audio_samples(PrismPlayer* player, float* buffer,
 }
 
 PRISM_API int prism_player_get_audio_sample_rate(PrismPlayer* player) {
-    /* Return output sample rate (48000 Hz), not source sample rate */
-    return (player && player->audio_codec_ctx) ? 48000 : 0;
+    /* Return configured output sample rate, not source sample rate */
+    if (!player) return 0;
+    return player->output_sample_rate > 0 ? player->output_sample_rate : 48000;
+}
+
+PRISM_API void prism_player_set_audio_sample_rate(PrismPlayer* player, int sample_rate) {
+    if (player && sample_rate > 0) {
+        player->output_sample_rate = sample_rate;
+        prism_log(1, "Audio output sample rate set to %d Hz", sample_rate);
+    }
 }
 
 PRISM_API int prism_player_get_audio_channels(PrismPlayer* player) {
